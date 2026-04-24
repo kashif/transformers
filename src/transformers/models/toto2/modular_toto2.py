@@ -460,15 +460,6 @@ class Toto2Attention(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _tau_rule(layer_idx: int, total_depth: int, residual_mult: float, residual_attn_ratio: float) -> float:
-    """u-μP residual scaling rule. Matches `unit_scaling.transformer_residual_scaling_rule`: produces a τ per
-    sub-layer (alternating attn/mlp, so 2*num_layers in total)."""
-    frac = layer_idx / max(total_depth - 1, 1)
-    # Blend attn-ratio at layer 0 → 1 at the last layer, then scale by global residual_mult.
-    blend = residual_attn_ratio ** (1.0 - frac)
-    return residual_mult * blend
-
-
 class Toto2DecoderLayer(nn.Module):
     """One Toto2 transformer block with τ-weighted residuals:
 
@@ -491,15 +482,11 @@ class Toto2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, include_weight=config.norm_include_weight
         )
 
-        total_depth = 2 * config.num_hidden_layers
-        tau_a = _tau_rule(2 * layer_idx, total_depth, config.residual_mult, config.residual_attn_ratio)
-        tau_m = _tau_rule(2 * layer_idx + 1, total_depth, config.residual_mult, config.residual_attn_ratio)
-        denom_a = (1.0 + tau_a * tau_a) ** 0.5
-        denom_m = (1.0 + tau_m * tau_m) ** 0.5
-        self.register_buffer("attn_alpha", torch.tensor(tau_a / denom_a), persistent=False)
-        self.register_buffer("attn_beta", torch.tensor(1.0 / denom_a), persistent=False)
-        self.register_buffer("mlp_alpha", torch.tensor(tau_m / denom_m), persistent=False)
-        self.register_buffer("mlp_beta", torch.tensor(1.0 / denom_m), persistent=False)
+        # Persistent scalar buffers matching Datadog's checkpoint names. They are train-time-learned in u-μP;
+        # for a fresh model we default to `config.residual_mult` (training code and/or the weight converter
+        # overwrite these with the real schedule).
+        self.register_buffer("attn_tau", torch.tensor(float(config.residual_mult)))
+        self.register_buffer("mlp_tau", torch.tensor(float(config.residual_mult)))
 
     def forward(
         self,
@@ -510,6 +497,9 @@ class Toto2DecoderLayer(nn.Module):
         rotary_dim: int | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
+        attn_denom = (1.0 + self.attn_tau * self.attn_tau).sqrt()
+        mlp_denom = (1.0 + self.mlp_tau * self.mlp_tau).sqrt()
+
         attn_out, _ = self.self_attn(
             self.norm1(hidden_states),
             position_embeddings=position_embeddings,
@@ -518,10 +508,10 @@ class Toto2DecoderLayer(nn.Module):
             rotary_dim=rotary_dim,
             **kwargs,
         )
-        hidden_states = self.attn_alpha * attn_out + self.attn_beta * hidden_states
+        hidden_states = (self.attn_tau / attn_denom) * attn_out + (1.0 / attn_denom) * hidden_states
 
         mlp_out = self.mlp(self.norm2(hidden_states))
-        hidden_states = self.mlp_alpha * mlp_out + self.mlp_beta * hidden_states
+        hidden_states = (self.mlp_tau / mlp_denom) * mlp_out + (1.0 / mlp_denom) * hidden_states
         return hidden_states
 
 
@@ -593,22 +583,12 @@ class Toto2PreTrainedModel(PreTrainedModel):
     @torch.no_grad()
     def _init_weights(self, module):
         super()._init_weights(module)
-        # Reinitialize non-persistent buffers (τ schedule + RoPE / xPos tables) so that reloading the model
-        # from meta device — which drops `persistent=False` buffers — produces the same outputs as a fresh init.
+        # Reinitialize buffers (RoPE / xPos tables + τ scalars) so that reloading the model from meta device
+        # — which drops `persistent=False` buffers and leaves uninitialized persistent ones — produces the
+        # same outputs as a fresh init.
         if isinstance(module, Toto2DecoderLayer):
-            total_depth = 2 * self.config.num_hidden_layers
-            tau_a = _tau_rule(
-                2 * module.layer_idx, total_depth, self.config.residual_mult, self.config.residual_attn_ratio
-            )
-            tau_m = _tau_rule(
-                2 * module.layer_idx + 1, total_depth, self.config.residual_mult, self.config.residual_attn_ratio
-            )
-            denom_a = (1.0 + tau_a * tau_a) ** 0.5
-            denom_m = (1.0 + tau_m * tau_m) ** 0.5
-            module.attn_alpha.copy_(torch.tensor(tau_a / denom_a, dtype=module.attn_alpha.dtype))
-            module.attn_beta.copy_(torch.tensor(1.0 / denom_a, dtype=module.attn_beta.dtype))
-            module.mlp_alpha.copy_(torch.tensor(tau_m / denom_m, dtype=module.mlp_alpha.dtype))
-            module.mlp_beta.copy_(torch.tensor(1.0 / denom_m, dtype=module.mlp_beta.dtype))
+            module.attn_tau.fill_(float(self.config.residual_mult))
+            module.mlp_tau.fill_(float(self.config.residual_mult))
         elif isinstance(module, Toto2RotaryEmbedding):
             rotary_dim = module.rotary_dim
             inv_freq = 1.0 / (
