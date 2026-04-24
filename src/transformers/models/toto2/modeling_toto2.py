@@ -32,6 +32,7 @@ from ...modeling_outputs import BaseModelOutput
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
+from ...utils.output_capturing import capture_outputs
 from .configuration_toto2 import Toto2Config
 
 
@@ -484,6 +485,37 @@ class Toto2PreTrainedModel(PreTrainedModel):
         "attentions": Toto2Attention,
     }
 
+    @torch.no_grad()
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        # Reinitialize non-persistent buffers (τ schedule + RoPE / xPos tables) so that reloading the model
+        # from meta device — which drops `persistent=False` buffers — produces the same outputs as a fresh init.
+        if isinstance(module, Toto2DecoderLayer):
+            total_depth = 2 * self.config.num_hidden_layers
+            tau_a = _tau_rule(
+                2 * module.layer_idx, total_depth, self.config.residual_mult, self.config.residual_attn_ratio
+            )
+            tau_m = _tau_rule(
+                2 * module.layer_idx + 1, total_depth, self.config.residual_mult, self.config.residual_attn_ratio
+            )
+            denom_a = (1.0 + tau_a * tau_a) ** 0.5
+            denom_m = (1.0 + tau_m * tau_m) ** 0.5
+            module.attn_alpha.copy_(torch.tensor(tau_a / denom_a, dtype=module.attn_alpha.dtype))
+            module.attn_beta.copy_(torch.tensor(1.0 / denom_a, dtype=module.attn_beta.dtype))
+            module.mlp_alpha.copy_(torch.tensor(tau_m / denom_m, dtype=module.mlp_alpha.dtype))
+            module.mlp_beta.copy_(torch.tensor(1.0 / denom_m, dtype=module.mlp_beta.dtype))
+        elif isinstance(module, Toto2RotaryEmbedding):
+            rotary_dim = module.rotary_dim
+            inv_freq = 1.0 / (
+                self.config.rope_theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+            )
+            module.inv_freq.copy_(inv_freq.to(device=module.inv_freq.device, dtype=module.inv_freq.dtype))
+            if module.xpos_base is not None:
+                xpos_base = (torch.arange(0, rotary_dim, 2, dtype=torch.float32) + 0.4 * rotary_dim) / (
+                    1.4 * rotary_dim
+                )
+                module.xpos_base.copy_(xpos_base.to(device=module.xpos_base.device, dtype=module.xpos_base.dtype))
+
 
 # ---------------------------------------------------------------------------
 # Core model — multivariate, alternating time/variate attention.
@@ -574,6 +606,7 @@ class Toto2Model(Toto2PreTrainedModel):
         return self.out_norm(hidden)
 
     @can_return_tuple
+    @capture_outputs
     @auto_docstring
     def forward(
         self,
@@ -700,6 +733,8 @@ class Toto2ForPrediction(Toto2PreTrainedModel):
 
         return Toto2PredictionOutput(
             last_hidden_state=outputs.last_hidden_state,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
             prediction_outputs=prediction_outputs,
             quantiles=quantiles_btnq,
             loss=loss,
