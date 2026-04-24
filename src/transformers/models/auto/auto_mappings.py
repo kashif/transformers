@@ -568,6 +568,7 @@ CONFIG_MAPPING_NAMES = OrderedDict(
         ("timesformer", "TimesformerConfig"),
         ("timm_backbone", "TimmBackboneConfig"),
         ("timm_wrapper", "TimmWrapperConfig"),
+        ("toto2", "Toto2Config"),
         ("trocr", "TrOCRConfig"),
         ("tvp", "TvpConfig"),
         ("udop", "UdopConfig"),

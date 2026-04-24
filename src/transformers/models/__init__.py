@@ -416,6 +416,7 @@ if TYPE_CHECKING:
     from .timesformer import *
     from .timm_backbone import *
     from .timm_wrapper import *
+    from .toto2 import *
     from .trocr import *
     from .tvp import *
     from .udop import *
