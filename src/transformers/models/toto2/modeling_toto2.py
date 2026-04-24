@@ -42,9 +42,9 @@ logger = logging.get_logger(__name__)
 @auto_docstring
 class Toto2ModelOutput(BaseModelOutput):
     r"""
-    loc (`torch.Tensor` of shape `(batch, num_variates, time)`):
+    loc (`torch.Tensor` of shape `(batch, sequence_length, num_input_channels)`):
         Per-patch location used to standardize the input (broadcast to each token in the patch).
-    scale (`torch.Tensor` of shape `(batch, num_variates, time)`):
+    scale (`torch.Tensor` of shape `(batch, sequence_length, num_input_channels)`):
         Per-patch scale used to standardize the input.
     """
 
@@ -56,16 +56,16 @@ class Toto2ModelOutput(BaseModelOutput):
 @auto_docstring
 class Toto2PredictionOutput(BaseModelOutput):
     r"""
-    quantiles (`torch.Tensor` of shape `(num_quantiles, batch, num_variates, horizon)`):
-        Quantile forecasts for each knot in `config.quantiles`.
-    mean_predictions (`torch.Tensor` of shape `(batch, num_variates, horizon)`):
-        Median (`q=0.5`) forecast if `0.5 in config.quantiles`, otherwise the central knot.
+    prediction_outputs (`torch.Tensor` of shape `(batch, prediction_length, num_input_channels)`):
+        Point (median) forecast. Named to match [`PatchTSTForPredictionOutput.prediction_outputs`].
+    quantiles (`torch.Tensor` of shape `(batch, prediction_length, num_input_channels, num_quantiles)`):
+        Quantile forecasts for each knot in `config.quantiles` along the last axis.
     loss (`torch.Tensor` of shape `(1,)`, *optional*):
         Quantile loss when `future_values` is provided.
     """
 
+    prediction_outputs: torch.Tensor | None = None
     quantiles: torch.Tensor | None = None
-    mean_predictions: torch.Tensor | None = None
     loss: torch.Tensor | float | None = None
 
 
@@ -566,28 +566,34 @@ class Toto2Model(Toto2PreTrainedModel):
     def forward(
         self,
         past_values: torch.Tensor,
-        past_values_mask: torch.Tensor | None = None,
+        past_observed_mask: torch.Tensor | None = None,
         series_ids: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Toto2ModelOutput:
         r"""
-        past_values (`torch.FloatTensor` of shape `(batch, num_variates, time)`):
-            Multivariate time-series context. `time` must be a multiple of `config.patch_size`.
-        past_values_mask (`torch.BoolTensor` of shape `(batch, num_variates, time)`, *optional*):
-            `True` at valid positions, `False` at masked positions. Defaults to all-valid.
-        series_ids (`torch.LongTensor` of shape `(batch, num_variates)`, *optional*):
-            Series identifiers for the variate axis, used to restrict cross-variate attention to matching ids.
-            Defaults to zeros (single group).
+        past_values (`torch.FloatTensor` of shape `(batch, sequence_length, num_input_channels)`):
+            Multivariate time-series context. `sequence_length` must be a multiple of `config.patch_size`. Matches
+            the axis convention used by [`PatchTSTModel`] / [`PatchTSMixerModel`].
+        past_observed_mask (`torch.BoolTensor` of shape `(batch, sequence_length, num_input_channels)`, *optional*):
+            `True` at observed positions, `False` at missing positions. Defaults to all-observed.
+        series_ids (`torch.LongTensor` of shape `(batch, num_input_channels)`, *optional*):
+            Series identifiers for the channel/variate axis, used to restrict cross-channel attention to matching
+            ids. Defaults to zeros (single group).
         """
-        if past_values_mask is None:
-            past_values_mask = torch.ones_like(past_values, dtype=torch.bool)
+        # External convention (B, T, N); internal compute uses (B, N, T) to keep the stack's reshapes cheap.
+        past_values_bnt = past_values.transpose(-1, -2)
+        if past_observed_mask is None:
+            past_observed_mask_bnt = torch.ones_like(past_values_bnt, dtype=torch.bool)
+        else:
+            past_observed_mask_bnt = past_observed_mask.transpose(-1, -2)
 
-        scaled, loc, scale = self.scaler(past_values, past_values_mask)
+        scaled, loc, scale = self.scaler(past_values_bnt, past_observed_mask_bnt)
         scaled = scaled.asinh()
-        hidden = self._embed_patches(scaled, past_values_mask)
+        hidden = self._embed_patches(scaled, past_observed_mask_bnt)
         hidden = self._run_stack(hidden, group_ids=series_ids, time_ids=None)
 
-        return Toto2ModelOutput(last_hidden_state=hidden, loc=loc, scale=scale)
+        # Return loc/scale back in (B, T, N) to match the input layout.
+        return Toto2ModelOutput(last_hidden_state=hidden, loc=loc.transpose(-1, -2), scale=scale.transpose(-1, -2))
 
 
 # ---------------------------------------------------------------------------
@@ -617,23 +623,28 @@ class Toto2ForPrediction(Toto2PreTrainedModel):
     def forward(
         self,
         past_values: torch.Tensor,
-        past_values_mask: torch.Tensor | None = None,
+        past_observed_mask: torch.Tensor | None = None,
         series_ids: torch.Tensor | None = None,
-        horizon_len: int | None = None,
+        prediction_length: int | None = None,
         future_values: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Toto2PredictionOutput:
         r"""
-        past_values (`torch.FloatTensor` of shape `(batch, num_variates, time)`): Multivariate context.
-        past_values_mask (`torch.BoolTensor`, *optional*): Observed-mask for `past_values`.
-        series_ids (`torch.LongTensor` of shape `(batch, num_variates)`, *optional*): Series ids for variate grouping.
-        horizon_len (`int`, *optional*): Number of future fine-resolution steps to forecast. Defaults to
-            `config.patch_size * config.num_output_patches` (one patch per token). Longer horizons iterate the model
-            in AR fashion with median feedback; that loop is not yet implemented in this scaffold.
-        future_values (`torch.Tensor`, *optional*): Fine-resolution ground truth for loss computation.
+        past_values (`torch.FloatTensor` of shape `(batch, sequence_length, num_input_channels)`):
+            Multivariate context. `sequence_length` must be a multiple of `config.patch_size`.
+        past_observed_mask (`torch.BoolTensor` of shape `(batch, sequence_length, num_input_channels)`, *optional*):
+            `True` at observed positions, `False` at missing positions.
+        series_ids (`torch.LongTensor` of shape `(batch, num_input_channels)`, *optional*):
+            Series ids for cross-channel grouping on variate-attention layers.
+        prediction_length (`int`, *optional*):
+            Number of future steps to forecast. Defaults to `config.patch_size * config.num_output_patches` (one
+            output patch per token). Longer horizons iterate the model in AR fashion with median feedback; that
+            loop is not yet implemented in this scaffold.
+        future_values (`torch.FloatTensor` of shape `(batch, prediction_length, num_input_channels)`, *optional*):
+            Ground truth for quantile-loss computation.
         """
         outputs = self.model(
-            past_values=past_values, past_values_mask=past_values_mask, series_ids=series_ids, **kwargs
+            past_values=past_values, past_observed_mask=past_observed_mask, series_ids=series_ids, **kwargs
         )
         hidden = outputs.last_hidden_state  # [B, N, S, D]
 
@@ -643,42 +654,42 @@ class Toto2ForPrediction(Toto2PreTrainedModel):
         )  # [B, N, S, patch_size * num_output_patches * num_q]
         head = head.view(*hidden.shape[:-1], self.config.num_output_patches, self.config.patch_size, num_q)
 
-        # One-patch prediction: take the last source position and the first output patch.
-        last = head[..., -1, 0, :, :]  # [B, N, patch_size, num_q]
-        last = last.permute(3, 0, 1, 2)  # [num_q, B, N, patch_size]
+        # One-patch prediction: take the last source position and the first output patch. Shape (B, N, patch, Q).
+        last_bnpq = head[..., -1, 0, :, :]
+        # Rescale using per-patch loc/scale (from the last input patch) and sort along the quantile axis.
+        loc = outputs.loc[:, -self.config.patch_size :, :].transpose(-1, -2).unsqueeze(-1)  # (B, N, patch, 1)
+        scale = outputs.scale[:, -self.config.patch_size :, :].transpose(-1, -2).unsqueeze(-1)
+        quant_bnpq = (last_bnpq.sinh() * scale + loc).sort(dim=-1).values
 
-        loc = outputs.loc[..., -self.config.patch_size :].unsqueeze(0)
-        scale = outputs.scale[..., -self.config.patch_size :].unsqueeze(0)
-        quantiles = last.sinh() * scale + loc
-        quantiles = quantiles.sort(dim=0).values
+        # Convert to the transformers-convention output shape: (B, prediction_length, N, num_q).
+        quantiles_btnq = quant_bnpq.permute(0, 2, 1, 3).contiguous()
 
         if 0.5 in self.config.quantiles:
-            median = quantiles[self.config.quantiles.index(0.5)]
+            median_idx = self.config.quantiles.index(0.5)
         else:
-            median = quantiles[num_q // 2]
+            median_idx = num_q // 2
+        prediction_outputs = quantiles_btnq[..., median_idx]  # (B, prediction_length, N)
 
         loss = None
         if future_values is not None:
-            target_len = min(future_values.shape[-1], median.shape[-1])
-            errors = future_values[..., :target_len].unsqueeze(0) - quantiles[..., :target_len]
-            q = torch.tensor(self.config.quantiles, device=errors.device, dtype=errors.dtype).view(
-                -1, *([1] * (errors.dim() - 1))
-            )
+            target_len = min(future_values.shape[1], quantiles_btnq.shape[1])
+            errors = future_values[:, :target_len, :, None] - quantiles_btnq[:, :target_len, :, :]
+            q = torch.tensor(self.config.quantiles, device=errors.device, dtype=errors.dtype)
             loss = torch.maximum((q - 1) * errors, q * errors).mean()
 
-        if horizon_len is not None and horizon_len > quantiles.shape[-1]:
+        if prediction_length is not None and prediction_length > quantiles_btnq.shape[1]:
             logger.warning(
-                "Requested `horizon_len=%d` exceeds `config.patch_size * config.num_output_patches=%d`. "
+                "Requested `prediction_length=%d` exceeds `config.patch_size * config.num_output_patches=%d`. "
                 "AR decoding beyond one patch is not yet implemented in this scaffold; returning the "
                 "single-patch forecast.",
-                horizon_len,
+                prediction_length,
                 self.config.patch_size * self.config.num_output_patches,
             )
 
         return Toto2PredictionOutput(
             last_hidden_state=outputs.last_hidden_state,
-            quantiles=quantiles,
-            mean_predictions=median,
+            prediction_outputs=prediction_outputs,
+            quantiles=quantiles_btnq,
             loss=loss,
         )
 

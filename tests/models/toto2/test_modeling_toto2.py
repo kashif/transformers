@@ -30,22 +30,22 @@ if is_torch_available():
 
 
 def _tiny_config(**overrides):
-    defaults = dict(
-        patch_size=16,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=4,
-        num_attention_heads=4,
-        num_key_value_heads=4,
-        head_dim=16,
-        layer_group_size=4,
-        num_variate_layers_per_group=1,
-        variate_layer_first=False,
-        qk_norm=False,
-        per_dim_scale=True,
-        use_xpos=True,
-        context_length=256,
-    )
+    defaults = {
+        "patch_size": 16,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 4,
+        "head_dim": 16,
+        "layer_group_size": 4,
+        "num_variate_layers_per_group": 1,
+        "variate_layer_first": False,
+        "qk_norm": False,
+        "per_dim_scale": True,
+        "use_xpos": True,
+        "context_length": 256,
+    }
     defaults.update(overrides)
     return Toto2Config(**defaults)
 
@@ -56,16 +56,18 @@ class Toto2ScaffoldTest(unittest.TestCase):
         config = _tiny_config()
         model = Toto2ForPrediction(config).to(torch_device).eval()
 
-        batch, num_var, time = 2, 3, 128
-        past_values = torch.randn(batch, num_var, time, device=torch_device)
+        batch, time, num_var = 2, 128, 3
+        past_values = torch.randn(batch, time, num_var, device=torch_device)
         with torch.no_grad():
-            out = model(past_values=past_values, horizon_len=config.patch_size)
+            out = model(past_values=past_values, prediction_length=config.patch_size)
 
         num_q = len(config.quantiles)
-        self.assertEqual(tuple(out.quantiles.shape), (num_q, batch, num_var, config.patch_size))
-        self.assertEqual(tuple(out.mean_predictions.shape), (batch, num_var, config.patch_size))
-        # Quantiles must be sorted along the quantile axis.
-        diffs = out.quantiles.diff(dim=0)
+        # (B, prediction_length, N, num_q) — matches PatchTST-style axis order.
+        self.assertEqual(tuple(out.quantiles.shape), (batch, config.patch_size, num_var, num_q))
+        # (B, prediction_length, N) — median/point forecast.
+        self.assertEqual(tuple(out.prediction_outputs.shape), (batch, config.patch_size, num_var))
+        # Quantiles must be sorted along the quantile axis (last dim).
+        diffs = out.quantiles.diff(dim=-1)
         self.assertTrue((diffs >= -1e-5).all(), f"quantiles should be monotone; min diff {diffs.min().item():.2e}")
 
     def test_alternating_stack_layer_types(self):
@@ -76,14 +78,15 @@ class Toto2ScaffoldTest(unittest.TestCase):
         actual = [layer.is_variate for layer in model.layers]
         self.assertEqual(actual, expected)
 
-    def test_past_values_mask_passed_through(self):
+    def test_past_observed_mask_passed_through(self):
         config = _tiny_config()
         model = Toto2ForPrediction(config).eval()
 
-        past_values = torch.randn(1, 2, 64)
+        # (B, sequence_length, num_input_channels) per transformers convention.
+        past_values = torch.randn(1, 64, 2)
         mask = torch.ones_like(past_values, dtype=torch.bool)
-        mask[..., :16] = False  # mask the first patch
+        mask[:, :16, :] = False  # mask the first patch
 
         with torch.no_grad():
-            out = model(past_values=past_values, past_values_mask=mask)
-        self.assertEqual(tuple(out.mean_predictions.shape), (1, 2, config.patch_size))
+            out = model(past_values=past_values, past_observed_mask=mask)
+        self.assertEqual(tuple(out.prediction_outputs.shape), (1, config.patch_size, 2))

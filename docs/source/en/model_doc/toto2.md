@@ -63,14 +63,15 @@ from transformers import Toto2Config, Toto2ForPrediction
 config = Toto2Config()                       # defaults match Toto-2.0-4m
 model = Toto2ForPrediction(config).eval()
 
-# Multivariate context: (batch, num_variates, time). `time` must be a multiple of config.patch_size.
-past_values = torch.randn(1, 4, 512)
+# Multivariate context follows the transformers convention shared with PatchTST / PatchTSMixer:
+#   past_values: (batch, sequence_length, num_input_channels)
+#   sequence_length must be a multiple of config.patch_size.
+past_values = torch.randn(1, 512, 4)
 with torch.no_grad():
-    outputs = model(past_values=past_values, horizon_len=config.patch_size)
+    outputs = model(past_values=past_values, prediction_length=config.patch_size)
 
-# Quantile forecasts have shape (num_quantiles, batch, num_variates, horizon).
-quantile_forecast = outputs.quantiles
-median_forecast = outputs.mean_predictions   # (batch, num_variates, horizon)
+point_forecast = outputs.prediction_outputs    # (batch, prediction_length, num_input_channels)
+quantile_forecast = outputs.quantiles          # (batch, prediction_length, num_input_channels, num_quantiles)
 ```
 
 ## Toto2Config
