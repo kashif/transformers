@@ -22,7 +22,7 @@ import unittest
 import torch
 
 from transformers import Toto2Config, is_torch_available
-from transformers.testing_utils import require_torch, torch_device
+from transformers.testing_utils import require_flash_attn, require_torch, require_torch_accelerator, torch_device
 
 
 if is_torch_available():
@@ -77,6 +77,29 @@ class Toto2ScaffoldTest(unittest.TestCase):
         expected = [False, False, False, True]  # single group of 4 layers
         actual = [layer.is_variate for layer in model.layers]
         self.assertEqual(actual, expected)
+
+    def _attn_kernel_equivalence(self, impl: str, dtype=torch.float32, tolerance: float = 1e-4):
+        config = _tiny_config()
+        eager = Toto2ForPrediction._from_config(config, attn_implementation="eager")
+        eager.to(dtype=dtype, device=torch_device).eval()
+        other = Toto2ForPrediction._from_config(config, attn_implementation=impl)
+        other.load_state_dict(eager.state_dict())
+        other.to(dtype=dtype, device=torch_device).eval()
+
+        past_values = torch.randn(2, 128, 3, dtype=dtype, device=torch_device)
+        with torch.no_grad():
+            out_eager = eager(past_values=past_values)
+            out_other = other(past_values=past_values)
+        diff = (out_eager.prediction_outputs - out_other.prediction_outputs).abs().max().item()
+        self.assertLess(diff, tolerance, f"{impl} vs eager prediction_outputs max diff {diff:.2e}")
+
+    def test_eager_matches_sdpa(self):
+        self._attn_kernel_equivalence("sdpa", dtype=torch.float32, tolerance=1e-4)
+
+    @require_flash_attn
+    @require_torch_accelerator
+    def test_eager_matches_flash_attention_2(self):
+        self._attn_kernel_equivalence("flash_attention_2", dtype=torch.bfloat16, tolerance=5e-3)
 
     def test_past_observed_mask_passed_through(self):
         config = _tiny_config()

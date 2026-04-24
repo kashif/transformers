@@ -343,7 +343,6 @@ class Toto2Attention(nn.Module):
             attention_mask,
             dropout=self.attention_dropout if self.training else 0.0,
             scaling=self.scaling,
-            is_causal=self.is_causal and attention_mask is None,
             **kwargs,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -525,6 +524,16 @@ class Toto2Model(Toto2PreTrainedModel):
         x = torch.cat([patch, mpatch], dim=-1)
         return self.patch_proj(x) + self.patch_skip(x)
 
+    @staticmethod
+    def _build_causal_mask(seq_len: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        """Additive causal mask `[1, 1, S, S]` compatible with all `ALL_ATTENTION_FUNCTIONS` backends.
+
+        We pass an explicit mask (rather than `is_causal=True`) so that eager/SDPA/FA2/flex all produce
+        identical outputs; the eager fallback only looks at `attention_mask`."""
+        min_value = torch.finfo(dtype).min
+        causal = torch.triu(torch.full((seq_len, seq_len), min_value, dtype=dtype, device=device), diagonal=1)
+        return causal.view(1, 1, seq_len, seq_len)
+
     def _run_stack(
         self, hidden: torch.Tensor, group_ids: torch.Tensor | None, time_ids: torch.Tensor | None
     ) -> torch.Tensor:
@@ -542,9 +551,11 @@ class Toto2Model(Toto2PreTrainedModel):
         else:
             xpos_scales = None
 
+        causal_mask = self._build_causal_mask(seq, hidden.dtype, device)
+
         for layer in self.layers:
             if layer.is_variate:
-                # reshape: [B, N, S, D] -> [B*S, N, D]  (attend across variates at each time)
+                # reshape: [B, N, S, D] -> [B*S, N, D]  (attend across variates at each time; no mask)
                 x = hidden.transpose(1, 2).reshape(bsz * seq, nvar, hidden.shape[-1])
                 x = layer(x)
                 hidden = x.view(bsz, seq, nvar, hidden.shape[-1]).transpose(1, 2).contiguous()
@@ -555,6 +566,7 @@ class Toto2Model(Toto2PreTrainedModel):
                     x,
                     position_embeddings=position_embeddings,
                     xpos_scales=xpos_scales,
+                    attention_mask=causal_mask,
                     rotary_dim=self.rotary_emb.rotary_dim,
                 )
                 hidden = x.view(bsz, nvar, seq, hidden.shape[-1])
