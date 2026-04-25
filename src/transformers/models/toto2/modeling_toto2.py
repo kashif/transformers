@@ -301,7 +301,12 @@ class Toto2Attention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.is_variate = config.is_variate_layer(layer_idx)
+        # Determine variate vs time layer from the per-group schedule.
+        mod = layer_idx % config.layer_group_size
+        if config.variate_layer_first:
+            self.is_variate = mod < config.num_variate_layers_per_group
+        else:
+            self.is_variate = mod >= config.layer_group_size - config.num_variate_layers_per_group
         self.head_dim = config.head_dim
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -387,8 +392,8 @@ class Toto2DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Toto2Config, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        self.is_variate = config.is_variate_layer(layer_idx)
         self.self_attn = Toto2Attention(config, layer_idx=layer_idx)
+        self.is_variate = self.self_attn.is_variate
         self.mlp = Toto2MLP(config)
         self.norm1 = Toto2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm2 = Toto2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

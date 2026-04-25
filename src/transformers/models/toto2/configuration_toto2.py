@@ -17,8 +17,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import math
 from collections.abc import Sequence
 
 from ...configuration_utils import PreTrainedConfig
@@ -74,19 +72,17 @@ class Toto2Config(PreTrainedConfig):
             Bias on attention linear projections.
         mlp_bias (`bool`, *optional*, defaults to `False`):
             Bias on MLP linear projections.
-        norm_eps (`float`, *optional*, defaults to 1e-4):
+        rms_norm_eps (`float`, *optional*, defaults to 1e-4):
             RMSNorm epsilon.
         residual_mult (`float`, *optional*, defaults to 0.75):
-            τ-rule global residual multiplier (u-μP).
-        residual_attn_ratio (`float`, *optional*, defaults to 5.13621546657774):
-            τ-rule attention:MLP residual ratio (u-μP). Compute via
-            `Toto2Config.compute_residual_attn_ratio(context_length, patch_size)`.
+            τ-rule global residual multiplier (u-μP). Used as the default value for the per-layer
+            `attn_tau` / `mlp_tau` buffers; the actual per-layer scalars come from the checkpoint.
         quantiles (`Sequence[float]`, *optional*, defaults to `(0.1, ..., 0.9)`):
             Quantile levels predicted by the output head.
         num_output_patches (`int`, *optional*, defaults to 1):
             Number of future patches predicted per token of hidden state.
-        context_length (`int`, *optional*, defaults to 4096):
-            Default context length used by [`Toto2ForPrediction`] (also sets `max_position_embeddings`).
+        max_position_embeddings (`int`, *optional*, defaults to 4096):
+            Maximum number of positions RoPE / xPos can index, taken from the trained context length.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             Attention dropout.
         initializer_range (`float`, *optional*, defaults to 0.02):
@@ -118,12 +114,11 @@ class Toto2Config(PreTrainedConfig):
         xpos_scale_exponent: float = 1.0,
         attn_bias: bool = True,
         mlp_bias: bool = False,
-        norm_eps: float = 1e-4,
+        rms_norm_eps: float = 1e-4,
         residual_mult: float = 0.75,
-        residual_attn_ratio: float = 5.136215466577748,
         quantiles: Sequence[float] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
         num_output_patches: int = 1,
-        context_length: int = 4096,
+        max_position_embeddings: int = 4096,
         attention_dropout: float = 0.0,
         initializer_range: float = 0.02,
         hidden_act: str = "silu",
@@ -148,13 +143,11 @@ class Toto2Config(PreTrainedConfig):
         self.xpos_scale_exponent = xpos_scale_exponent
         self.attn_bias = attn_bias
         self.mlp_bias = mlp_bias
-        self.rms_norm_eps = norm_eps
+        self.rms_norm_eps = rms_norm_eps
         self.residual_mult = residual_mult
-        self.residual_attn_ratio = residual_attn_ratio
         self.quantiles = list(quantiles)
         self.num_output_patches = num_output_patches
-        self.context_length = context_length
-        self.max_position_embeddings = context_length
+        self.max_position_embeddings = max_position_embeddings
         self.attention_dropout = attention_dropout
         self.initializer_range = initializer_range
         self.hidden_act = hidden_act
@@ -168,12 +161,6 @@ class Toto2Config(PreTrainedConfig):
         )
 
         super().__init__(**kwargs)
-
-    @staticmethod
-    def compute_residual_attn_ratio(context_length: int, patch_size: int) -> float:
-        """u-μP default: `sqrt(S / log(S))` with `S = context_length / patch_size`."""
-        s = context_length / patch_size
-        return math.sqrt(s / math.log(s))
 
     def is_variate_layer(self, layer_idx: int) -> bool:
         mod = layer_idx % self.layer_group_size

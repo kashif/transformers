@@ -126,9 +126,8 @@ def _build_hf_config(orig_cfg: dict) -> Toto2Config:
         use_xpos=orig_cfg.get("use_xpos", False),
         attn_bias=orig_cfg["attn_bias"],
         mlp_bias=orig_cfg["mlp_bias"],
-        norm_eps=orig_cfg["norm_eps"],
+        rms_norm_eps=orig_cfg["norm_eps"],
         residual_mult=orig_cfg["residual_mult"],
-        residual_attn_ratio=orig_cfg["residual_attn_ratio"],
         num_output_patches=orig_cfg.get("num_output_patches", 1),
     )
 
