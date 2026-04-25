@@ -14,13 +14,12 @@
 """PyTorch Toto 2 model (Datadog time-series foundation model)."""
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from huggingface_hub.dataclasses import strict
 
 from ... import initialization as init
