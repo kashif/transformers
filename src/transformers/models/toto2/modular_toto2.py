@@ -21,6 +21,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from huggingface_hub.dataclasses import strict
+
 from ... import initialization as init
 from ...configuration_utils import PreTrainedConfig
 from ...modeling_layers import GradientCheckpointingLayer
@@ -36,143 +38,80 @@ logger = logging.get_logger(__name__)
 
 
 @auto_docstring(checkpoint="Datadog/Toto-2.0-4m")
+@strict
 class Toto2Config(PreTrainedConfig):
     r"""
-    Configuration for Toto 2, a decoder-only multivariate time-series foundation model. The architecture interleaves
-    causal *time* attention layers (attending over the time axis, patched) with bidirectional *variate* attention
-    layers (attending over the variate axis at a fixed time position). Linear layers use μP-style fan-in scaling,
-    attention uses `1/head_dim` scaling (μP), and residual connections follow the τ-weighted scheme of u-μP.
+    layer_group_size (`int`, *optional*, defaults to 4):
+        Size of one time/variate layer group. Within each group `num_variate_layers_per_group` layers run
+        cross-variate attention; the rest run causal time attention.
+    num_variate_layers_per_group (`int`, *optional*, defaults to 1):
+        Number of variate-attention layers in each group.
+    variate_layer_first (`bool`, *optional*, defaults to `False`):
+        If `True`, variate layers come at the start of each group; if `False`, at the end.
+    qk_norm (`bool`, *optional*, defaults to `False`):
+        Apply RMSNorm to Q/K before attention.
+    per_dim_scale (`bool`, *optional*, defaults to `True`):
+        Apply a learned positive per-dimension scale to Q before attention (softplus-parameterized).
+    use_xpos (`bool`, *optional*, defaults to `True`):
+        Use xPos length-extrapolation scaling on the time-axis rotary embedding.
+    partial_rotary_factor (`float`, *optional*, defaults to 0.5):
+        Fraction of `head_dim` rotated by RoPE; the rest is passed through.
+    rope_theta (`float`, *optional*, defaults to 10000.0):
+        RoPE base frequency.
+    xpos_scale_base (`int`, *optional*, defaults to 256):
+        xPos scale base.
+    xpos_scale_exponent (`float`, *optional*, defaults to 1.0):
+        xPos scale exponent (query side; key side uses `-xpos_scale_exponent`).
+    attn_bias (`bool`, *optional*, defaults to `True`):
+        Bias on attention linear projections.
+    residual_mult (`float`, *optional*, defaults to 0.75):
+        Default value for the per-layer τ scalars used in u-μP-style weighted residual connections; the
+        actual per-layer values come from the checkpoint into `attn_tau` / `mlp_tau` buffers.
+    quantiles (`Sequence[float]`, *optional*, defaults to `(0.1, 0.2, ..., 0.9)`):
+        Quantile knots predicted by the output head.
+    num_output_patches (`int`, *optional*, defaults to 1):
+        Number of future patches predicted per token of hidden state.
 
-    Args:
-        patch_size (`int`, *optional*, defaults to 32):
-            Number of time points per input patch.
-        hidden_size (`int`, *optional*, defaults to 256):
-            Model width (aka `d_model`).
-        intermediate_size (`int`, *optional*, defaults to 688):
-            MLP intermediate size (aka `d_ff`); the SwiGLU produces `2*intermediate_size` activations from
-            `hidden_size` and contracts back to `hidden_size`.
-        num_hidden_layers (`int`, *optional*, defaults to 4):
-            Total number of transformer layers (time + variate).
-        num_attention_heads (`int`, *optional*, defaults to 4):
-            Number of query heads.
-        num_key_value_heads (`int`, *optional*, defaults to 4):
-            Number of key/value groups. `num_attention_heads // num_key_value_heads` > 1 enables GQA.
-        head_dim (`int`, *optional*, defaults to 64):
-            Head dimension for Q/K and V (kept identical for the converted 4M checkpoint).
-        layer_group_size (`int`, *optional*, defaults to 4):
-            Size of the time/variate layer group. Layers `i % layer_group_size` within a group are variate (when
-            `variate_layer_first=True`) or the last `num_variate_layers_per_group` indices of the group (otherwise).
-        num_variate_layers_per_group (`int`, *optional*, defaults to 1):
-            Variate-attention layers per group.
-        variate_layer_first (`bool`, *optional*, defaults to `False`):
-            If `True`, variate layers come at the start of each group; if `False`, at the end.
-        qk_norm (`bool`, *optional*, defaults to `False`):
-            Apply RMSNorm to Q/K before attention.
-        per_dim_scale (`bool`, *optional*, defaults to `True`):
-            Apply a learned positive per-dimension scale to Q before attention (softplus-parameterized).
-        use_xpos (`bool`, *optional*, defaults to `True`):
-            Use RoPE with xPos extrapolation scaling on the time axis.
-        partial_rotary_factor (`float`, *optional*, defaults to 0.5):
-            Fraction of `head_dim` that is rotated by RoPE (the rest is passed through).
-        rope_theta (`float`, *optional*, defaults to 10000.0):
-            RoPE base.
-        xpos_scale_base (`int`, *optional*, defaults to 256):
-            xPos scale base.
-        xpos_scale_exponent (`float`, *optional*, defaults to 1.0):
-            xPos scale exponent (query side; key side uses `-xpos_scale_exponent`).
-        attn_bias (`bool`, *optional*, defaults to `True`):
-            Bias on attention linear projections.
-        mlp_bias (`bool`, *optional*, defaults to `False`):
-            Bias on MLP linear projections.
-        rms_norm_eps (`float`, *optional*, defaults to 1e-4):
-            RMSNorm epsilon.
-        residual_mult (`float`, *optional*, defaults to 0.75):
-            τ-rule global residual multiplier (u-μP). Used as the default value for the per-layer
-            `attn_tau` / `mlp_tau` buffers; the actual per-layer scalars come from the checkpoint.
-        quantiles (`Sequence[float]`, *optional*, defaults to `(0.1, ..., 0.9)`):
-            Quantile levels predicted by the output head.
-        num_output_patches (`int`, *optional*, defaults to 1):
-            Number of future patches predicted per token of hidden state.
-        max_position_embeddings (`int`, *optional*, defaults to 4096):
-            Maximum number of positions RoPE / xPos can index, taken from the trained context length.
-        attention_dropout (`float`, *optional*, defaults to 0.0):
-            Attention dropout.
-        initializer_range (`float`, *optional*, defaults to 0.02):
-            Initializer std.
+    ```python
+    >>> from transformers import Toto2Config, Toto2ForPrediction
+
+    >>> configuration = Toto2Config()
+    >>> model = Toto2ForPrediction(configuration)
+    >>> configuration = model.config
+    ```
     """
 
     model_type = "toto2"
     keys_to_ignore_at_inference = []
     is_encoder_decoder = False
 
-    def __init__(
-        self,
-        patch_size: int = 32,
-        hidden_size: int = 256,
-        intermediate_size: int = 688,
-        num_hidden_layers: int = 4,
-        num_attention_heads: int = 4,
-        num_key_value_heads: int = 4,
-        head_dim: int = 64,
-        layer_group_size: int = 4,
-        num_variate_layers_per_group: int = 1,
-        variate_layer_first: bool = False,
-        qk_norm: bool = False,
-        per_dim_scale: bool = True,
-        use_xpos: bool = True,
-        partial_rotary_factor: float = 0.5,
-        rope_theta: float = 10000.0,
-        xpos_scale_base: int = 256,
-        xpos_scale_exponent: float = 1.0,
-        attn_bias: bool = True,
-        mlp_bias: bool = False,
-        rms_norm_eps: float = 1e-4,
-        residual_mult: float = 0.75,
-        quantiles: Sequence[float] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
-        num_output_patches: int = 1,
-        max_position_embeddings: int = 4096,
-        attention_dropout: float = 0.0,
-        initializer_range: float = 0.02,
-        hidden_act: str = "silu",
-        **kwargs,
-    ):
-        self.patch_size = patch_size
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = num_key_value_heads
-        self.head_dim = head_dim
-        self.layer_group_size = layer_group_size
-        self.num_variate_layers_per_group = num_variate_layers_per_group
-        self.variate_layer_first = variate_layer_first
-        self.qk_norm = qk_norm
-        self.per_dim_scale = per_dim_scale
-        self.use_xpos = use_xpos
-        self.partial_rotary_factor = partial_rotary_factor
-        self.rope_theta = rope_theta
-        self.xpos_scale_base = xpos_scale_base
-        self.xpos_scale_exponent = xpos_scale_exponent
-        self.attn_bias = attn_bias
-        self.mlp_bias = mlp_bias
-        self.rms_norm_eps = rms_norm_eps
-        self.residual_mult = residual_mult
-        self.quantiles = list(quantiles)
-        self.num_output_patches = num_output_patches
-        self.max_position_embeddings = max_position_embeddings
-        self.attention_dropout = attention_dropout
-        self.initializer_range = initializer_range
-        self.hidden_act = hidden_act
-
-        assert num_hidden_layers % layer_group_size == 0, (
-            f"num_hidden_layers ({num_hidden_layers}) must be divisible by layer_group_size ({layer_group_size})"
-        )
-        assert num_attention_heads % num_key_value_heads == 0, (
-            f"num_attention_heads ({num_attention_heads}) must be divisible by num_key_value_heads "
-            f"({num_key_value_heads})"
-        )
-
-        super().__init__(**kwargs)
+    patch_size: int = 32
+    hidden_size: int = 256
+    intermediate_size: int = 688
+    num_hidden_layers: int = 4
+    num_attention_heads: int = 4
+    num_key_value_heads: int = 4
+    head_dim: int = 64
+    layer_group_size: int = 4
+    num_variate_layers_per_group: int = 1
+    variate_layer_first: bool = False
+    qk_norm: bool = False
+    per_dim_scale: bool = True
+    use_xpos: bool = True
+    partial_rotary_factor: float = 0.5
+    rope_theta: float = 10000.0
+    xpos_scale_base: int = 256
+    xpos_scale_exponent: float = 1.0
+    attn_bias: bool = True
+    mlp_bias: bool = False
+    rms_norm_eps: float = 1e-4
+    residual_mult: float = 0.75
+    quantiles: list[float] | tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+    num_output_patches: int = 1
+    max_position_embeddings: int = 4096
+    attention_dropout: float = 0.0
+    initializer_range: float = 0.02
+    hidden_act: str = "silu"
 
     def is_variate_layer(self, layer_idx: int) -> bool:
         mod = layer_idx % self.layer_group_size
