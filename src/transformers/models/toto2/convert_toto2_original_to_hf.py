@@ -127,7 +127,6 @@ def _build_hf_config(orig_cfg: dict) -> Toto2Config:
         attn_bias=orig_cfg["attn_bias"],
         mlp_bias=orig_cfg["mlp_bias"],
         norm_eps=orig_cfg["norm_eps"],
-        norm_include_weight=orig_cfg["norm_include_weight"],
         residual_mult=orig_cfg["residual_mult"],
         residual_attn_ratio=orig_cfg["residual_attn_ratio"],
         num_output_patches=orig_cfg.get("num_output_patches", 1),
@@ -145,41 +144,39 @@ def convert_state_dict(orig_sd: dict[str, torch.Tensor], cfg: Toto2Config) -> di
 
     # ---- Patch projection (InputResidualMLP: linear1 → U.silu → linear2; + skip_proj; wrapped in residual_add τ=1) ----
     # linear1 feeds into U.silu → linear2, so its own μP factor is the only thing to bake here.
+    # Toto2ResidualBlock layout: input_layer → SiLU → output_layer; residual_layer adds skip.
     w, b = _bake_linear(orig_sd["patch_proj.linear1.weight"], orig_sd["patch_proj.linear1.bias"])
-    new_sd["model.patch_proj.0.weight"], new_sd["model.patch_proj.0.bias"] = w, b
-    # linear2: bake μP factor *and* the U.silu forward scale (applied to the input activation → equivalent
-    # to multiplying W but not b) *and* the τ=1 residual_add factor (multiplies the whole `y = W x + b`).
+    new_sd["model.patch_proj.input_layer.weight"], new_sd["model.patch_proj.input_layer.bias"] = w, b
     w, b = _bake_linear(
         orig_sd["patch_proj.linear2.weight"],
         orig_sd["patch_proj.linear2.bias"],
         extra_weight_factor=U_SILU_FORWARD * RESIDUAL_ADD_TAU_1,
         extra_bias_factor=RESIDUAL_ADD_TAU_1,
     )
-    new_sd["model.patch_proj.2.weight"], new_sd["model.patch_proj.2.bias"] = w, b
-    # skip_proj: no silu upstream, only μP + residual_add.
+    new_sd["model.patch_proj.output_layer.weight"], new_sd["model.patch_proj.output_layer.bias"] = w, b
     w, b = _bake_linear(
         orig_sd["patch_proj.skip_proj.weight"],
         orig_sd["patch_proj.skip_proj.bias"],
         extra_weight_factor=RESIDUAL_ADD_TAU_1,
         extra_bias_factor=RESIDUAL_ADD_TAU_1,
     )
-    new_sd["model.patch_skip.weight"], new_sd["model.patch_skip.bias"] = w, b
+    new_sd["model.patch_proj.residual_layer.weight"], new_sd["model.patch_proj.residual_layer.bias"] = w, b
 
-    # ---- Output head (OutputResidualMLP) — linear2 / skip_proj use scale_power=1.0 (LinearReadout). ----
+    # ---- Output head (OutputResidualMLP) — output_layer / residual_layer use scale_power=1.0 (LinearReadout). ----
     w, b = _bake_linear(
         orig_sd["output_head.param_projection.proj.linear1.weight"],
         orig_sd["output_head.param_projection.proj.linear1.bias"],
-        scale_power=0.5,  # hidden linear
+        scale_power=0.5,
     )
-    new_sd["output_head.0.weight"], new_sd["output_head.0.bias"] = w, b
+    new_sd["output_head.input_layer.weight"], new_sd["output_head.input_layer.bias"] = w, b
     w, b = _bake_linear(
         orig_sd["output_head.param_projection.proj.linear2.weight"],
         orig_sd["output_head.param_projection.proj.linear2.bias"],
-        scale_power=1.0,  # readout linear
+        scale_power=1.0,
         extra_weight_factor=U_SILU_FORWARD * RESIDUAL_ADD_TAU_1,
         extra_bias_factor=RESIDUAL_ADD_TAU_1,
     )
-    new_sd["output_head.2.weight"], new_sd["output_head.2.bias"] = w, b
+    new_sd["output_head.output_layer.weight"], new_sd["output_head.output_layer.bias"] = w, b
     w, b = _bake_linear(
         orig_sd["output_head.param_projection.proj.skip_proj.weight"],
         orig_sd["output_head.param_projection.proj.skip_proj.bias"],
@@ -187,7 +184,7 @@ def convert_state_dict(orig_sd: dict[str, torch.Tensor], cfg: Toto2Config) -> di
         extra_weight_factor=RESIDUAL_ADD_TAU_1,
         extra_bias_factor=RESIDUAL_ADD_TAU_1,
     )
-    new_sd["output_skip.weight"], new_sd["output_skip.bias"] = w, b
+    new_sd["output_head.residual_layer.weight"], new_sd["output_head.residual_layer.bias"] = w, b
 
     # ---- Transformer layers ----
     for i in range(cfg.num_hidden_layers):

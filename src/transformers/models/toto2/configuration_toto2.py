@@ -76,8 +76,6 @@ class Toto2Config(PreTrainedConfig):
             Bias on MLP linear projections.
         norm_eps (`float`, *optional*, defaults to 1e-4):
             RMSNorm epsilon.
-        norm_include_weight (`bool`, *optional*, defaults to `False`):
-            Whether RMSNorm includes a learnable affine weight.
         residual_mult (`float`, *optional*, defaults to 0.75):
             τ-rule global residual multiplier (u-μP).
         residual_attn_ratio (`float`, *optional*, defaults to 5.13621546657774):
@@ -121,7 +119,6 @@ class Toto2Config(PreTrainedConfig):
         attn_bias: bool = True,
         mlp_bias: bool = False,
         norm_eps: float = 1e-4,
-        norm_include_weight: bool = False,
         residual_mult: float = 0.75,
         residual_attn_ratio: float = 5.136215466577748,
         quantiles: Sequence[float] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
@@ -152,7 +149,6 @@ class Toto2Config(PreTrainedConfig):
         self.attn_bias = attn_bias
         self.mlp_bias = mlp_bias
         self.rms_norm_eps = norm_eps
-        self.norm_include_weight = norm_include_weight
         self.residual_mult = residual_mult
         self.residual_attn_ratio = residual_attn_ratio
         self.quantiles = list(quantiles)

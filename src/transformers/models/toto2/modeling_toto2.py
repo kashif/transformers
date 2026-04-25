@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from ... import initialization as init
 from ...activations import ACT2FN
 from ...integrations import use_kernel_forward_from_hub
+from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutput
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
@@ -73,18 +74,17 @@ class Toto2PredictionOutput(BaseModelOutput):
 
 @use_kernel_forward_from_hub("RMSNorm")
 class Toto2RMSNorm(nn.Module):
-    """RMSNorm as in Llama; `Toto2Config.norm_include_weight=False` gives a pure, unweighted norm."""
+    """Standard Llama RMSNorm. The Toto-2.0-* checkpoints train with `norm_include_weight=False` (no
+    affine weight); for those, the `weight` parameter loads as all-ones from the conversion script and is
+    effectively frozen at one — there is no checkpoint mismatch and no need for a special-case branch."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-4, include_weight: bool = False) -> None:
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
         """
         Toto2RMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        if not include_weight:
-            # Freeze the weight to 1 and stop tracking it as a learnable parameter.
-            self.weight = nn.Parameter(torch.ones(hidden_size), requires_grad=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
@@ -95,6 +95,25 @@ class Toto2RMSNorm(nn.Module):
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+class Toto2ResidualBlock(nn.Module):
+    """SiLU residual MLP `output = output_layer(silu(input_layer(x))) + residual_layer(x)`.
+
+    Mirrors `TimesFmResidualBlock` in shape so the layer's named members (`input_layer`, `output_layer`,
+    `residual_layer`) match across time-series models in the library."""
+
+    def __init__(self, input_dims: int, hidden_dims: int, output_dims: int):
+        super().__init__()
+        self.input_layer = nn.Linear(input_dims, hidden_dims)
+        self.activation = nn.SiLU()
+        self.output_layer = nn.Linear(hidden_dims, output_dims)
+        self.residual_layer = nn.Linear(input_dims, output_dims)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        hidden = self.input_layer(x)
+        hidden = self.activation(hidden)
+        return self.output_layer(hidden) + self.residual_layer(x)
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +306,7 @@ class Toto2Attention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.rotary_dim = int(round(config.head_dim * config.partial_rotary_factor))
         # μP scaling: 1/d_k instead of 1/sqrt(d_k).
         self.scaling = 1.0 / self.head_dim
         self.attention_dropout = config.attention_dropout
@@ -298,8 +318,8 @@ class Toto2Attention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attn_bias)
 
         if config.qk_norm:
-            self.q_norm = Toto2RMSNorm(self.head_dim, eps=config.rms_norm_eps, include_weight=False)
-            self.k_norm = Toto2RMSNorm(self.head_dim, eps=config.rms_norm_eps, include_weight=False)
+            self.q_norm = Toto2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = Toto2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         else:
             self.q_norm = None
             self.k_norm = None
@@ -315,7 +335,6 @@ class Toto2Attention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         xpos_scales: tuple[torch.Tensor | None, torch.Tensor | None] | None = None,
         attention_mask: torch.Tensor | None = None,
-        rotary_dim: int | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -332,7 +351,7 @@ class Toto2Attention(nn.Module):
         if position_embeddings is not None and not self.is_variate:
             cos, sin = position_embeddings
             q_xpos, k_xpos = xpos_scales if xpos_scales is not None else (None, None)
-            q, k = apply_rotary_with_xpos(q, k, cos, sin, q_xpos, k_xpos, rotary_dim)
+            q, k = apply_rotary_with_xpos(q, k, cos, sin, q_xpos, k_xpos, self.rotary_dim)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -356,7 +375,7 @@ class Toto2Attention(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class Toto2DecoderLayer(nn.Module):
+class Toto2DecoderLayer(GradientCheckpointingLayer):
     """One Toto2 transformer block with τ-weighted residuals:
 
     `hidden = (tau_a / sqrt(1 + tau_a^2)) * attn(norm(hidden)) + (1 / sqrt(1 + tau_a^2)) * hidden`
@@ -371,12 +390,8 @@ class Toto2DecoderLayer(nn.Module):
         self.is_variate = config.is_variate_layer(layer_idx)
         self.self_attn = Toto2Attention(config, layer_idx=layer_idx)
         self.mlp = Toto2MLP(config)
-        self.norm1 = Toto2RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, include_weight=config.norm_include_weight
-        )
-        self.norm2 = Toto2RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, include_weight=config.norm_include_weight
-        )
+        self.norm1 = Toto2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm2 = Toto2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Persistent scalar buffers matching Datadog's checkpoint names. They are train-time-learned in u-μP;
         # for a fresh model we default to `config.residual_mult` (training code and/or the weight converter
@@ -390,7 +405,6 @@ class Toto2DecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         xpos_scales: tuple[torch.Tensor | None, torch.Tensor | None] | None = None,
         attention_mask: torch.Tensor | None = None,
-        rotary_dim: int | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         attn_denom = (1.0 + self.attn_tau * self.attn_tau).sqrt()
@@ -401,7 +415,6 @@ class Toto2DecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             xpos_scales=xpos_scales,
             attention_mask=attention_mask,
-            rotary_dim=rotary_dim,
             **kwargs,
         )
         hidden_states = (self.attn_tau / attn_denom) * attn_out + (1.0 / attn_denom) * hidden_states
@@ -513,19 +526,16 @@ class Toto2Model(Toto2PreTrainedModel):
         self.scaler = Toto2PatchedCausalStdScaler(patch_size=config.patch_size)
 
         # Patch tokenizer: concatenate scaled patch + mask channel, project to hidden_size.
-        self.patch_proj = nn.Sequential(
-            nn.Linear(2 * config.patch_size, 4 * config.hidden_size),
-            nn.SiLU(),
-            nn.Linear(4 * config.hidden_size, config.hidden_size),
+        self.patch_proj = Toto2ResidualBlock(
+            input_dims=2 * config.patch_size,
+            hidden_dims=4 * config.hidden_size,
+            output_dims=config.hidden_size,
         )
-        self.patch_skip = nn.Linear(2 * config.patch_size, config.hidden_size)
 
         self.layers = nn.ModuleList(
             [Toto2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.out_norm = Toto2RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, include_weight=config.norm_include_weight
-        )
+        self.out_norm = Toto2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Toto2RotaryEmbedding(config)
 
         self.post_init()
@@ -538,7 +548,7 @@ class Toto2Model(Toto2PreTrainedModel):
         patch = scaled.view(bsz, nvar, s, p)
         mpatch = (~mask).to(scaled.dtype).view(bsz, nvar, s, p)
         x = torch.cat([patch, mpatch], dim=-1)
-        return self.patch_proj(x) + self.patch_skip(x)
+        return self.patch_proj(x)
 
     @staticmethod
     def _build_causal_mask(seq_len: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -583,7 +593,6 @@ class Toto2Model(Toto2PreTrainedModel):
                     position_embeddings=position_embeddings,
                     xpos_scales=xpos_scales,
                     attention_mask=causal_mask,
-                    rotary_dim=self.rotary_emb.rotary_dim,
                 )
                 hidden = x.view(bsz, nvar, seq, hidden.shape[-1])
 
@@ -638,12 +647,11 @@ class Toto2ForPrediction(Toto2PreTrainedModel):
 
         # Quantile-knot head: project hidden_size -> (num_output_patches * patch_size * num_quantiles).
         out_size = config.num_output_patches * config.patch_size * len(config.quantiles)
-        self.output_head = nn.Sequential(
-            nn.Linear(config.hidden_size, 4 * config.hidden_size),
-            nn.SiLU(),
-            nn.Linear(4 * config.hidden_size, out_size),
+        self.output_head = Toto2ResidualBlock(
+            input_dims=config.hidden_size,
+            hidden_dims=4 * config.hidden_size,
+            output_dims=out_size,
         )
-        self.output_skip = nn.Linear(config.hidden_size, out_size)
 
         self.post_init()
 
@@ -678,9 +686,7 @@ class Toto2ForPrediction(Toto2PreTrainedModel):
         hidden = outputs.last_hidden_state  # [B, N, S, D]
 
         num_q = len(self.config.quantiles)
-        head = self.output_head(hidden) + self.output_skip(
-            hidden
-        )  # [B, N, S, patch_size * num_output_patches * num_q]
+        head = self.output_head(hidden)  # [B, N, S, patch_size * num_output_patches * num_q]
         head = head.view(*hidden.shape[:-1], self.config.num_output_patches, self.config.patch_size, num_q)
 
         # One-patch prediction: take the last source position and the first output patch. Shape (B, N, patch, Q).
