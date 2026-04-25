@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ... import initialization as init
 from ...configuration_utils import PreTrainedConfig
 from ...modeling_outputs import BaseModelOutput
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
@@ -583,23 +584,26 @@ class Toto2PreTrainedModel(PreTrainedModel):
     @torch.no_grad()
     def _init_weights(self, module):
         super()._init_weights(module)
-        # Reinitialize buffers (RoPE / xPos tables + τ scalars) so that reloading the model from meta device
-        # — which drops `persistent=False` buffers and leaves uninitialized persistent ones — produces the
-        # same outputs as a fresh init.
+        # Reinitialize buffers (RoPE / xPos tables + τ scalars). The transformers `initialization`
+        # helpers (`init.constant_`, `init.copy_`) check `_is_hf_initialized` on each tensor and skip
+        # if it was already populated from the checkpoint — so this is safe to call after state_dict
+        # load and matches the Gemma `embed_scale` pattern.
         if isinstance(module, Toto2DecoderLayer):
-            module.attn_tau.fill_(float(self.config.residual_mult))
-            module.mlp_tau.fill_(float(self.config.residual_mult))
+            init.constant_(module.attn_tau, float(self.config.residual_mult))
+            init.constant_(module.mlp_tau, float(self.config.residual_mult))
         elif isinstance(module, Toto2RotaryEmbedding):
             rotary_dim = module.rotary_dim
             inv_freq = 1.0 / (
                 self.config.rope_theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
             )
-            module.inv_freq.copy_(inv_freq.to(device=module.inv_freq.device, dtype=module.inv_freq.dtype))
+            init.copy_(module.inv_freq, inv_freq.to(device=module.inv_freq.device, dtype=module.inv_freq.dtype))
             if module.xpos_base is not None:
                 xpos_base = (torch.arange(0, rotary_dim, 2, dtype=torch.float32) + 0.4 * rotary_dim) / (
                     1.4 * rotary_dim
                 )
-                module.xpos_base.copy_(xpos_base.to(device=module.xpos_base.device, dtype=module.xpos_base.dtype))
+                init.copy_(
+                    module.xpos_base, xpos_base.to(device=module.xpos_base.device, dtype=module.xpos_base.dtype)
+                )
 
 
 # ---------------------------------------------------------------------------

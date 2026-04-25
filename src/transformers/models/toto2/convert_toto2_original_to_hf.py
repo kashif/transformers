@@ -139,7 +139,6 @@ def convert_state_dict(orig_sd: dict[str, torch.Tensor], cfg: Toto2Config) -> di
     num_heads = cfg.num_attention_heads
     num_kv = cfg.num_key_value_heads
     qk_dim = cfg.head_dim
-    v_dim = cfg.head_dim
     rotary_dim = int(round(cfg.head_dim * cfg.partial_rotary_factor))
 
     new_sd: dict[str, torch.Tensor] = {}
@@ -230,13 +229,16 @@ def convert_state_dict(orig_sd: dict[str, torch.Tensor], cfg: Toto2Config) -> di
         new_sd[f"model.layers.{i}.self_attn.o_proj.weight"] = w
         new_sd[f"model.layers.{i}.self_attn.o_proj.bias"] = b
 
-        # Per-dim scale: no baking needed. The reference composes `unit_scaling.softplus`
-        # (forward scale `1/0.52103`) with `per_dim_scale` (forward scale `0.52103`) — the two cancel, so
-        # the effective multiplier applied to Q is `F.softplus(p) / log(2)`, which is exactly what
-        # `Toto2PerDimScale.forward` computes with plain `F.softplus`. Store the raw parameter as-is.
-        new_sd[f"model.layers.{i}.self_attn.per_dim_scale.per_dim_scale"] = orig_sd[
-            f"transformer.layers.{i}.attn._pds.per_dim_scale"
-        ].clone()
+        # Per-dim scale: the `unit_scaling.softplus` forward scale (1/0.52103) and `per_dim_scale`'s
+        # output scale (0.52103) cancel, so the effective multiplier reduces to `F.softplus(p)/log(2)` —
+        # exactly what `Toto2PerDimScale.forward` computes. We *do* need to permute the rotary half of
+        # this parameter so its element ordering matches the permuted Q (the parameter is multiplied
+        # element-wise into Q, which we permuted via `_interleaved_to_half_split`).
+        raw_pds = orig_sd[f"transformer.layers.{i}.attn._pds.per_dim_scale"].clone()
+        even = torch.arange(0, rotary_dim, 2)
+        odd = torch.arange(1, rotary_dim, 2)
+        perm = torch.cat([even, odd, torch.arange(rotary_dim, qk_dim)])
+        new_sd[f"model.layers.{i}.self_attn.per_dim_scale.per_dim_scale"] = raw_pds.index_select(0, perm)
 
         # MLP: fc1 packs [gate | up] (Datadog order) → transformers needs up_proj, gate_proj.
         fc1 = orig_sd[f"transformer.layers.{i}.ffn.fc1.weight"]  # (2 * inter, hidden)
