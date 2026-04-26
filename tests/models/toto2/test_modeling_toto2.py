@@ -86,8 +86,10 @@ class Toto2ModelTester:
         self.use_xpos = use_xpos
         self.is_training = is_training
 
-        # Used by `ModelTesterMixin` for some size checks.
-        self.seq_length = context_length // patch_size
+        # `Toto2ForPrediction.forward` runs the stack over `[context | pred_zero_patches]`, so the
+        # hidden-state / attention tensors checked by `ModelTesterMixin` cover `context_patches + 1`
+        # (the default single-block decode emits one output patch).
+        self.seq_length = context_length // patch_size + 1
 
     def get_config(self):
         return Toto2Config(

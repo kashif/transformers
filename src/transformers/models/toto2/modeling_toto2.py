@@ -28,17 +28,15 @@ import torch.nn.functional as F
 
 from ... import initialization as init
 from ...activations import ACT2FN
+from ...cache_utils import Cache, DynamicCache
 from ...integrations import use_kernel_forward_from_hub
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutput
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
-from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
+from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.output_capturing import capture_outputs
 from .configuration_toto2 import Toto2Config
-
-
-logger = logging.get_logger(__name__)
 
 
 @dataclass
@@ -307,6 +305,23 @@ class Toto2Attention(nn.Module):
             self.is_variate = mod < config.num_variate_layers_per_group
         else:
             self.is_variate = mod >= config.layer_group_size - config.num_variate_layers_per_group
+
+        # `time_layer_idx` counts only the time-attention layers (variate layers do not interact with the
+        # autoregressive KV cache because their attention is across the variate axis at a fixed time).
+        if self.is_variate:
+            self.time_layer_idx = -1
+        else:
+            count = 0
+            for prev in range(layer_idx):
+                prev_mod = prev % config.layer_group_size
+                prev_is_variate = (
+                    prev_mod < config.num_variate_layers_per_group
+                    if config.variate_layer_first
+                    else prev_mod >= config.layer_group_size - config.num_variate_layers_per_group
+                )
+                if not prev_is_variate:
+                    count += 1
+            self.time_layer_idx = count
         self.head_dim = config.head_dim
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -340,6 +355,7 @@ class Toto2Attention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         xpos_scales: tuple[torch.Tensor | None, torch.Tensor | None] | None = None,
         attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -357,6 +373,11 @@ class Toto2Attention(nn.Module):
             cos, sin = position_embeddings
             q_xpos, k_xpos = xpos_scales if xpos_scales is not None else (None, None)
             q, k = apply_rotary_with_xpos(q, k, cos, sin, q_xpos, k_xpos, self.rotary_dim)
+
+        # Time layers participate in the autoregressive KV cache; variate layers do not (their attention
+        # is over the variate axis at fixed time, no caching benefit and no shared state across iterations).
+        if past_key_values is not None and not self.is_variate:
+            k, v = past_key_values.update(k, v, self.time_layer_idx)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -410,6 +431,7 @@ class Toto2DecoderLayer(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         xpos_scales: tuple[torch.Tensor | None, torch.Tensor | None] | None = None,
         attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         attn_denom = (1.0 + self.attn_tau * self.attn_tau).sqrt()
@@ -420,6 +442,7 @@ class Toto2DecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             xpos_scales=xpos_scales,
             attention_mask=attention_mask,
+            past_key_values=past_key_values,
             **kwargs,
         )
         hidden_states = (self.attn_tau / attn_denom) * attn_out + (1.0 / attn_denom) * hidden_states
@@ -556,17 +579,24 @@ class Toto2Model(Toto2PreTrainedModel):
         return self.patch_proj(x)
 
     @staticmethod
-    def _build_causal_mask(seq_len: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        """Additive causal mask `[1, 1, S, S]` compatible with all `ALL_ATTENTION_FUNCTIONS` backends.
-
-        We pass an explicit mask (rather than `is_causal=True`) so that eager/SDPA/FA2/flex all produce
-        identical outputs; the eager fallback only looks at `attention_mask`."""
+    def _build_causal_mask(new_len: int, past_len: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        """Additive causal mask `[1, 1, new_len, past_len + new_len]`. New queries attend to all cached
+        past keys plus a causal triangle within the new positions. Used both for the no-cache case
+        (`past_len=0` collapses this to a standard `(new_len, new_len)` causal mask) and for incremental
+        AR decoding."""
         min_value = torch.finfo(dtype).min
-        causal = torch.triu(torch.full((seq_len, seq_len), min_value, dtype=dtype, device=device), diagonal=1)
-        return causal.view(1, 1, seq_len, seq_len)
+        total = past_len + new_len
+        mask = torch.zeros((new_len, total), dtype=dtype, device=device)
+        causal = torch.triu(torch.full((new_len, new_len), min_value, dtype=dtype, device=device), diagonal=1)
+        mask[:, past_len:] = causal
+        return mask.view(1, 1, new_len, total)
 
     def _run_stack(
-        self, hidden: torch.Tensor, group_ids: torch.Tensor | None, time_ids: torch.Tensor | None
+        self,
+        hidden: torch.Tensor,
+        group_ids: torch.Tensor | None,
+        time_ids: torch.Tensor | None,
+        past_key_values: Cache | None = None,
     ) -> torch.Tensor:
         # hidden: [B, N, S, D]
         bsz, nvar, seq, _ = hidden.shape
@@ -582,7 +612,8 @@ class Toto2Model(Toto2PreTrainedModel):
         else:
             xpos_scales = None
 
-        causal_mask = self._build_causal_mask(seq, hidden.dtype, device)
+        past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
+        causal_mask = self._build_causal_mask(seq, past_len, hidden.dtype, device)
 
         for layer in self.layers:
             if layer.is_variate:
@@ -598,6 +629,7 @@ class Toto2Model(Toto2PreTrainedModel):
                     position_embeddings=position_embeddings,
                     xpos_scales=xpos_scales,
                     attention_mask=causal_mask,
+                    past_key_values=past_key_values,
                 )
                 hidden = x.view(bsz, nvar, seq, hidden.shape[-1])
 
@@ -611,6 +643,8 @@ class Toto2Model(Toto2PreTrainedModel):
         past_values: torch.Tensor,
         past_observed_mask: torch.Tensor | None = None,
         series_ids: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        time_ids: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Toto2ModelOutput:
         r"""
@@ -622,6 +656,11 @@ class Toto2Model(Toto2PreTrainedModel):
         series_ids (`torch.LongTensor` of shape `(batch, num_input_channels)`, *optional*):
             Series identifiers for the channel/variate axis, used to restrict cross-channel attention to matching
             ids. Defaults to zeros (single group).
+        past_key_values (`Cache`, *optional*):
+            Key/value cache populated by a previous decode block of [`Toto2ForPrediction`]. When provided,
+            time-axis layers extend the cache rather than recomputing K/V for cached positions.
+        time_ids (`torch.LongTensor` of shape `(sequence_length,)`, *optional*):
+            Absolute time positions used by RoPE / xPos. Defaults to `arange(sequence_length)`.
         """
         # External convention (B, T, N); internal compute uses (B, N, T) to keep the stack's reshapes cheap.
         past_values_bnt = past_values.transpose(-1, -2)
@@ -633,7 +672,12 @@ class Toto2Model(Toto2PreTrainedModel):
         scaled, loc, scale = self.scaler(past_values_bnt, past_observed_mask_bnt)
         scaled = scaled.asinh()
         hidden = self._embed_patches(scaled, past_observed_mask_bnt)
-        hidden = self._run_stack(hidden, group_ids=series_ids, time_ids=None)
+        hidden = self._run_stack(
+            hidden,
+            group_ids=series_ids,
+            time_ids=time_ids,
+            past_key_values=past_key_values,
+        )
 
         # Return loc/scale back in (B, T, N) to match the input layout.
         return Toto2ModelOutput(last_hidden_state=hidden, loc=loc.transpose(-1, -2), scale=scale.transpose(-1, -2))
@@ -660,7 +704,19 @@ class Toto2ForPrediction(Toto2PreTrainedModel):
 
         self.post_init()
 
+    @staticmethod
+    def _clamp_nonfinite(x: torch.Tensor) -> torch.Tensor:
+        """Replace `+inf` with the max finite value along the last axis and `-inf` with the min, leaving
+        finite values untouched. Mirrors the original Datadog `Toto2Model._clamp_nonfinite`."""
+        finite = torch.where(x.isfinite(), x, torch.zeros_like(x))
+        max_finite = finite.amax(dim=-1, keepdim=True)
+        min_finite = finite.amin(dim=-1, keepdim=True)
+        x = torch.where(x == float("inf"), max_finite, x)
+        x = torch.where(x == float("-inf"), min_finite, x)
+        return x
+
     @can_return_tuple
+    @capture_outputs
     @auto_docstring
     def forward(
         self,
@@ -668,6 +724,8 @@ class Toto2ForPrediction(Toto2PreTrainedModel):
         past_observed_mask: torch.Tensor | None = None,
         series_ids: torch.Tensor | None = None,
         prediction_length: int | None = None,
+        decode_block_size: int | None = None,
+        use_cache: bool | None = None,
         future_values: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Toto2PredictionOutput:
@@ -679,35 +737,158 @@ class Toto2ForPrediction(Toto2PreTrainedModel):
         series_ids (`torch.LongTensor` of shape `(batch, num_input_channels)`, *optional*):
             Series ids for cross-channel grouping on variate-attention layers.
         prediction_length (`int`, *optional*):
-            Number of future steps to forecast. Defaults to `config.patch_size * config.num_output_patches` (one
-            output patch per token). Longer horizons iterate the model in AR fashion with median feedback; that
-            loop is not yet implemented in this scaffold.
+            Number of future steps to forecast. Defaults to `config.patch_size * config.num_output_patches`
+            (one output patch per token). For longer horizons the model decodes block-by-block with median
+            feedback, optionally using a KV cache (see `decode_block_size` and `use_cache`).
+        decode_block_size (`int`, *optional*):
+            Number of fine-resolution steps emitted per decode block. Must be a multiple of
+            `config.patch_size`. Defaults to `prediction_length` (single-block decode). Smaller values
+            refresh the causal scaler and feed predicted medians back into the context more often, at the
+            cost of more decode iterations.
+        use_cache (`bool`, *optional*):
+            Whether to use a [`DynamicCache`] across decode iterations on the time-axis layers. Defaults
+            to `True` when more than one block is needed (i.e. `decode_block_size < prediction_length`).
+            Set to `False` to force a full recompute at every block.
         future_values (`torch.FloatTensor` of shape `(batch, prediction_length, num_input_channels)`, *optional*):
             Ground truth for quantile-loss computation.
         """
-        outputs = self.model(
-            past_values=past_values, past_observed_mask=past_observed_mask, series_ids=series_ids, **kwargs
-        )
-        hidden = outputs.last_hidden_state  # [B, N, S, D]
-
-        num_q = len(self.config.quantiles)
-        head = self.output_head(hidden)  # [B, N, S, patch_size * num_output_patches * num_q]
-        head = head.view(*hidden.shape[:-1], self.config.num_output_patches, self.config.patch_size, num_q)
-
-        # One-patch prediction: take the last source position and the first output patch. Shape (B, N, patch, Q).
-        last_bnpq = head[..., -1, 0, :, :]
-        # Rescale using per-patch loc/scale (from the last input patch) and sort along the quantile axis.
-        loc = outputs.loc[:, -self.config.patch_size :, :].transpose(-1, -2).unsqueeze(-1)  # (B, N, patch, 1)
-        scale = outputs.scale[:, -self.config.patch_size :, :].transpose(-1, -2).unsqueeze(-1)
-        quant_bnpq = (last_bnpq.sinh() * scale + loc).sort(dim=-1).values
-
-        # Convert to the transformers-convention output shape: (B, prediction_length, N, num_q).
-        quantiles_btnq = quant_bnpq.permute(0, 2, 1, 3).contiguous()
-
-        if 0.5 in self.config.quantiles:
-            median_idx = self.config.quantiles.index(0.5)
+        # External (B, T, N) → internal (B, N, T) for the multivariate stack.
+        bnt_target = past_values.transpose(-1, -2)
+        if past_observed_mask is None:
+            bnt_mask = torch.ones_like(bnt_target, dtype=torch.bool)
         else:
-            median_idx = num_q // 2
+            bnt_mask = past_observed_mask.transpose(-1, -2).to(torch.bool)
+
+        patch_size = self.config.patch_size
+        nop = self.config.num_output_patches
+        num_q = len(self.config.quantiles)
+        n_var = bnt_target.shape[-2]
+        device = bnt_target.device
+        dtype = bnt_target.dtype
+
+        prediction_length = prediction_length or (patch_size * nop)
+        num_patches = math.ceil(prediction_length / patch_size)
+        if decode_block_size is None or decode_block_size <= 0:
+            block_size_patches = num_patches
+        else:
+            if decode_block_size % patch_size != 0:
+                raise ValueError(
+                    f"decode_block_size ({decode_block_size}) must be a multiple of patch_size ({patch_size})"
+                )
+            block_size_patches = min(decode_block_size // patch_size, num_patches)
+        if use_cache is None:
+            use_cache = block_size_patches < num_patches
+
+        initial_len = bnt_target.shape[-1]
+        initial_patches = math.ceil(initial_len / patch_size)
+        pred_len = num_patches * patch_size
+
+        # Build the AR working buffers: context | zero-padded prediction region. The very last patch of the
+        # context mask is forced to `True` to match the training convention (short series whose tail was
+        # padded with unobserved positions would otherwise be out of distribution).
+        full_target = torch.cat(
+            [bnt_target, torch.zeros(*bnt_target.shape[:-1], pred_len, device=device, dtype=dtype)], dim=-1
+        )
+        full_mask = torch.cat(
+            [
+                bnt_mask[..., :-patch_size],
+                torch.ones(*bnt_mask.shape[:-1], patch_size, device=device, dtype=torch.bool),
+                torch.zeros(*bnt_mask.shape[:-1], pred_len, device=device, dtype=torch.bool),
+            ],
+            dim=-1,
+        )
+
+        if series_ids is None:
+            series_ids = torch.zeros(*bnt_target.shape[:-1], dtype=torch.long, device=device)
+
+        all_time_ids = torch.arange(initial_patches, initial_patches + 2 * num_patches, device=device)
+
+        past_key_values = DynamicCache(config=self.config) if use_cache else None
+        block_quantiles_list: list[torch.Tensor] = []
+        last_outputs: Toto2ModelOutput | None = None
+        patches_predicted = 0
+
+        median_idx = self.config.quantiles.index(0.5) if 0.5 in self.config.quantiles else num_q // 2
+
+        while patches_predicted < num_patches:
+            block = min(block_size_patches, num_patches - patches_predicted)
+            pred_start = initial_len + patches_predicted * patch_size
+            pred_end = pred_start + block * patch_size
+
+            # Re-run the causal scaler over the (possibly median-filled) full context.
+            _, static_loc, static_scale = self.model.scaler(full_target, full_mask)
+
+            if past_key_values is not None and patches_predicted > 0:
+                # Cache active and not the first block: only the previous block's medians need to be
+                # re-embedded and pushed into the cache; everything earlier is already there.
+                prev_offset = (patches_predicted - block_size_patches) * patch_size
+                ctx_start = initial_len + prev_offset
+                ctx_end = pred_start
+                time_ids = all_time_ids[patches_predicted - block_size_patches : patches_predicted + block]
+            else:
+                # No cache, or the first block: feed everything up to (and including) the next pred zero.
+                ctx_start = 0
+                ctx_end = pred_start
+                time_ids = None  # default arange in `_run_stack`
+
+            ctx_loc = static_loc[..., ctx_start:ctx_end]
+            ctx_scale = static_scale[..., ctx_start:ctx_end]
+            ctx_scaled = torch.where(
+                full_mask[..., ctx_start:ctx_end],
+                (full_target[..., ctx_start:ctx_end] - ctx_loc) / ctx_scale,
+                torch.zeros_like(ctx_loc),
+            ).asinh()
+            context_x = self.model._embed_patches(ctx_scaled, full_mask[..., ctx_start:ctx_end])
+
+            pred_loc = static_loc[..., pred_start:pred_end]
+            pred_scale = static_scale[..., pred_start:pred_end]
+            pred_scaled = torch.where(
+                full_mask[..., pred_start:pred_end],
+                (full_target[..., pred_start:pred_end] - pred_loc) / pred_scale,
+                torch.zeros_like(pred_loc),
+            ).asinh()
+            pred_x = self.model._embed_patches(pred_scaled, full_mask[..., pred_start:pred_end])
+
+            combined_x = torch.cat([context_x, pred_x], dim=-2)
+
+            x_out = self.model._run_stack(
+                combined_x, group_ids=series_ids, time_ids=time_ids, past_key_values=past_key_values
+            )
+
+            # Pop the ephemeral pred-region from the cache so the next iteration only re-feeds median patches.
+            if past_key_values is not None and past_key_values.get_seq_length() > 0:
+                past_key_values.crop(past_key_values.get_seq_length() - block)
+
+            # Take outputs at positions [-(block+1):-1]: each emits the next-patch prediction.
+            pred_out = x_out[..., -(block + 1) : -1, :]
+            head = self.output_head(pred_out)  # (B, N, block, patch_size * nop * num_q)
+            head = head.view(*head.shape[:-1], nop, patch_size, num_q)
+            # `[..., 0, :, :]` keeps the first output-patch per source token (default `nop=1` → identity).
+            block_q = head[..., 0, :, :]  # (B, N, block, patch_size, num_q)
+
+            loc = static_loc[..., pred_start:pred_end].view(*static_loc.shape[:-1], block, patch_size)
+            scale = static_scale[..., pred_start:pred_end].view(*static_scale.shape[:-1], block, patch_size)
+            block_q_real = block_q.sinh() * scale.unsqueeze(-1) + loc.unsqueeze(-1)
+            block_q_real = self._clamp_nonfinite(block_q_real).sort(dim=-1).values
+            block_quantiles_list.append(block_q_real)
+
+            patches_predicted += block
+
+            if patches_predicted < num_patches:
+                # Median feedback: fill the just-predicted region in `full_target` and mark it observed.
+                median_real = block_q_real[..., median_idx]  # (B, N, block, patch_size)
+                full_target[..., pred_start:pred_end] = median_real.reshape(
+                    *median_real.shape[:-2], block * patch_size
+                )
+                full_mask[..., pred_start:pred_end] = True
+
+            last_outputs = Toto2ModelOutput(last_hidden_state=x_out, loc=static_loc, scale=static_scale)
+
+        # Concatenate per-block predictions: each is (B, N, block, patch_size, num_q).
+        all_q = torch.cat(block_quantiles_list, dim=-3)  # (B, N, num_patches, patch_size, num_q)
+        all_q = all_q.reshape(*all_q.shape[:-3], num_patches * patch_size, num_q)[..., :prediction_length, :]
+        # Convert (B, N, prediction_length, num_q) → (B, prediction_length, N, num_q).
+        quantiles_btnq = all_q.transpose(-3, -2).contiguous()
         prediction_outputs = quantiles_btnq[..., median_idx]  # (B, prediction_length, N)
 
         loss = None
@@ -717,19 +898,8 @@ class Toto2ForPrediction(Toto2PreTrainedModel):
             q = torch.tensor(self.config.quantiles, device=errors.device, dtype=errors.dtype)
             loss = torch.maximum((q - 1) * errors, q * errors).mean()
 
-        if prediction_length is not None and prediction_length > quantiles_btnq.shape[1]:
-            logger.warning(
-                "Requested `prediction_length=%d` exceeds `config.patch_size * config.num_output_patches=%d`. "
-                "AR decoding beyond one patch is not yet implemented in this scaffold; returning the "
-                "single-patch forecast.",
-                prediction_length,
-                self.config.patch_size * self.config.num_output_patches,
-            )
-
         return Toto2PredictionOutput(
-            last_hidden_state=outputs.last_hidden_state,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+            last_hidden_state=last_outputs.last_hidden_state if last_outputs is not None else None,
             prediction_outputs=prediction_outputs,
             quantiles=quantiles_btnq,
             loss=loss,
