@@ -42,7 +42,9 @@ class AutoRenderer:
         )
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *inputs, renderer=None, trust_remote_code=False, **kwargs):
+    def from_pretrained(
+        cls, pretrained_model_name_or_path, *inputs, renderer=None, strict=False, trust_remote_code=False, **kwargs
+    ):
         r"""
         Instantiate the renderer for a model from a pretrained model vocabulary, resolved the same way as the model's
         tokenizer (in-library renderers registry via a `"renderer"` declaration in `tokenizer_config.json`, custom Hub
@@ -54,6 +56,9 @@ class AutoRenderer:
                 A model id of a model hosted on the Hub, or a path to a directory containing tokenizer files.
             renderer (`str` or renderer object, *optional*):
                 Override renderer resolution with a renderer name to construct, or an already-built renderer object.
+            strict (`bool`, *optional*, defaults to `False`):
+                Require a per-family renderer and raise if only the generic `apply_chat_template` fallback is
+                available. Recommended for multi-turn RL training. See [`~PreTrainedTokenizerBase.get_renderer`].
             trust_remote_code (`bool`, *optional*, defaults to `False`):
                 Whether to allow loading the tokenizer and/or a renderer defined in custom code on the Hub.
             inputs, kwargs:
@@ -73,4 +78,4 @@ class AutoRenderer:
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, *inputs, trust_remote_code=trust_remote_code, **kwargs
         )
-        return tokenizer.get_renderer(renderer, trust_remote_code=trust_remote_code)
+        return tokenizer.get_renderer(renderer, strict=strict, trust_remote_code=trust_remote_code)

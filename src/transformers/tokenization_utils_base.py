@@ -3358,7 +3358,7 @@ class PreTrainedTokenizerBase(PushToHubMixin):
 
         return chat_template
 
-    def get_renderer(self, renderer: str | object | None = None, *, trust_remote_code: bool = False):
+    def get_renderer(self, renderer: str | object | None = None, *, strict: bool = False, trust_remote_code: bool = False):
         """
         Resolve a *renderer* for this tokenizer — a Python object that renders messages to token ids,
         parses sampled token ids back to structured messages, and extends a multi-turn rollout without
@@ -3382,6 +3382,13 @@ class PreTrainedTokenizerBase(PushToHubMixin):
         Args:
             renderer (`str` or renderer object, *optional*):
                 A renderer name to construct, or an already-built renderer object to return as-is.
+            strict (`bool`, *optional*, defaults to `False`):
+                Require a per-family renderer. If resolution lands on a generic `apply_chat_template`
+                fallback (the renderers `DefaultRenderer`, or the built-in one when `renderers` is not
+                installed), raise instead of returning it. Multi-turn RL training should set this: the
+                fallback cannot guarantee a safe `bridge_to_next_turn`, so silently accepting it is how
+                token-level corruption slips into training unnoticed. The error names the fix (install
+                `renderers`, or declare a `"renderer"` for the model).
             trust_remote_code (`bool`, *optional*, defaults to `False`):
                 Whether to allow loading a renderer defined in custom code on the Hub via
                 `auto_map["AutoRenderer"]`.
@@ -3395,21 +3402,24 @@ class PreTrainedTokenizerBase(PushToHubMixin):
             return renderer
 
         if not is_renderers_available():
+            if strict:
+                raise ValueError(
+                    f"No per-family renderer is available for {self.name_or_path}: the `renderers` package is not "
+                    "installed, so only the generic apply_chat_template fallback exists, which cannot guarantee a "
+                    "safe multi-turn bridge. Install it with `pip install transformers[renderers]`."
+                )
             return _DefaultJinjaRenderer(self)
 
-        from renderers import config_from_name, create_renderer
+        from renderers import DefaultRenderer, config_from_name, create_renderer
 
-        # 1. Explicit name argument.
         if isinstance(renderer, str):
-            return create_renderer(self, config_from_name(renderer))
-
-        # 2. Hub declaration on the tokenizer config: a plain "renderer" name, or custom
-        #    code referenced via auto_map["AutoRenderer"] (loaded only with trust_remote_code).
-        if self._renderer is not None:
-            return create_renderer(self, config_from_name(self._renderer))
-
-        auto_map = getattr(self, "_auto_map", None) or {}
-        if "AutoRenderer" in auto_map:
+            # 1. Explicit name argument.
+            resolved = create_renderer(self, config_from_name(renderer))
+        elif self._renderer is not None:
+            # 2a. Hub declaration on the tokenizer config: a plain "renderer" name.
+            resolved = create_renderer(self, config_from_name(self._renderer))
+        elif "AutoRenderer" in (getattr(self, "_auto_map", None) or {}):
+            # 2b. Custom renderer code referenced via auto_map (loaded only with trust_remote_code).
             if not trust_remote_code:
                 raise ValueError(
                     f"Loading the renderer for {self.name_or_path} requires custom code defined in its "
@@ -3417,14 +3427,21 @@ class PreTrainedTokenizerBase(PushToHubMixin):
                 )
             from .dynamic_module_utils import get_class_from_dynamic_module
 
-            class_ref = auto_map["AutoRenderer"]
+            class_ref = self._auto_map["AutoRenderer"]
             class_ref = class_ref[0] if isinstance(class_ref, (list, tuple)) else class_ref
-            renderer_cls = get_class_from_dynamic_module(class_ref, self.name_or_path)
-            return renderer_cls(self)
+            resolved = get_class_from_dynamic_module(class_ref, self.name_or_path)(self)
+        else:
+            # 3. Let `renderers` auto-resolve from the tokenizer's name (its MODEL_RENDERER_MAP),
+            #    falling back to its own DefaultRenderer for unknown models.
+            resolved = create_renderer(self)
 
-        # 3. Let `renderers` auto-resolve from the tokenizer's name (its MODEL_RENDERER_MAP),
-        #    falling back to its own DefaultRenderer for unknown models.
-        return create_renderer(self)
+        if strict and isinstance(resolved, DefaultRenderer):
+            raise ValueError(
+                f"No per-family renderer resolved for {self.name_or_path}; got the generic apply_chat_template "
+                "fallback, which cannot guarantee a safe multi-turn bridge. Declare a renderer for the model "
+                '(`"renderer": "<name>"` in tokenizer_config.json) or pass one explicitly via `renderer=`.'
+            )
+        return resolved
 
     def render_conversation(
         self,
@@ -3433,6 +3450,7 @@ class PreTrainedTokenizerBase(PushToHubMixin):
         add_generation_prompt: bool = False,
         renderer: str | object | None = None,
         *,
+        strict: bool = False,
         trust_remote_code: bool = False,
     ):
         """
@@ -3454,13 +3472,15 @@ class PreTrainedTokenizerBase(PushToHubMixin):
                 Whether to append the generation prompt that opens the next assistant turn.
             renderer (`str` or renderer object, *optional*):
                 Override renderer resolution (see [`~PreTrainedTokenizerBase.get_renderer`]).
+            strict (`bool`, *optional*, defaults to `False`):
+                Forwarded to [`~PreTrainedTokenizerBase.get_renderer`]; require a per-family renderer.
             trust_remote_code (`bool`, *optional*, defaults to `False`):
                 Forwarded to [`~PreTrainedTokenizerBase.get_renderer`].
 
         Returns:
             The renderer's `RenderedTokens` object (`token_ids`, `message_indices`).
         """
-        resolved = self.get_renderer(renderer, trust_remote_code=trust_remote_code)
+        resolved = self.get_renderer(renderer, strict=strict, trust_remote_code=trust_remote_code)
         return resolved.render(conversation, tools=tools, add_generation_prompt=add_generation_prompt)
 
     def save_chat_templates(

@@ -73,6 +73,9 @@ class RendererFallbackTest(unittest.TestCase):
             # The fallback cannot prove a byte-for-byte extension, so it declines the bridge.
             self.assertIsNone(renderer.bridge_to_next_turn([1], [2], [{"role": "tool", "content": "4"}]))
             self.assertEqual(renderer.get_stop_token_ids(), [self.tokenizer.eos_token_id])
+            # strict refuses the non-bridging fallback instead of silently returning it.
+            with self.assertRaises(ValueError):
+                self.tokenizer.get_renderer(strict=True)
         finally:
             tokenization_utils_base.is_renderers_available = original
 
@@ -113,6 +116,16 @@ class RendererTest(unittest.TestCase):
         tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
         renderer = tokenizer.get_renderer()
         self.assertEqual(type(renderer).__name__, "DefaultRenderer")
+
+    def test_strict_rejects_generic_fallback_but_a_declaration_satisfies_it(self):
+        # A model that auto-resolves to the generic DefaultRenderer fails strict resolution: silently
+        # accepting it is how multi-turn token corruption slips into RL training unnoticed.
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+        with self.assertRaises(ValueError):
+            tokenizer.get_renderer(strict=True)
+        # A per-family renderer (here, the model's own) satisfies strict resolution.
+        tokenizer3 = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+        self.assertEqual(type(tokenizer3.get_renderer(strict=True)).__name__, "Qwen3Renderer")
 
     def test_render_conversation_matches_apply_chat_template_for_default_renderer(self):
         # The renderers DefaultRenderer wraps apply_chat_template, so token ids must agree.

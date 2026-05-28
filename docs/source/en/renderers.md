@@ -77,6 +77,15 @@ Equivalently, from a tokenizer you already have:
 >>> renderer = tokenizer.get_renderer()  # doctest: +SKIP
 ```
 
+For multi-turn RL training, pass `strict=True`. Resolution can silently land on the generic
+`apply_chat_template` fallback — which cannot guarantee a safe `bridge_to_next_turn` — when no per-family renderer is
+installed or declared for the model. That silent degradation is exactly how token-level corruption slips into training
+unnoticed. `strict=True` raises instead, naming the fix (install `renderers`, or declare a `"renderer"` for the model):
+
+```python
+>>> renderer = AutoRenderer.from_pretrained("zai-org/GLM-4.5", strict=True)  # doctest: +SKIP
+```
+
 For the next turn, extend the previous sampled stream instead of re-rendering the history:
 
 ```python
