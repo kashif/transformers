@@ -52,6 +52,7 @@ from .utils import (
     is_mlx_available,
     is_numpy_array,
     is_protobuf_available,
+    is_renderers_available,
     is_tokenizers_available,
     is_torch_available,
     is_torch_device,
@@ -966,6 +967,80 @@ INIT_TOKENIZER_DOCSTRING = r"""
 """
 
 
+@dataclass
+class RenderedTokens:
+    """Minimal result of [`~PreTrainedTokenizerBase.render_conversation`].
+
+    Mirrors the `renderers.RenderedTokens` shape so callers can treat the built-in
+    fallback and a real renderer uniformly.
+
+    Attributes:
+        token_ids (`list[int]`): The rendered token ids.
+        message_indices (`list[int]`): One entry per token, giving the index of the
+            source message in `conversation`, or `-1` for structural scaffolding.
+    """
+
+    token_ids: list[int]
+    message_indices: list[int]
+
+
+class _DefaultJinjaRenderer:
+    """Built-in fallback renderer used when the optional `renderers` package is absent.
+
+    Wraps `apply_chat_template`. It provides the render side (with per-token
+    `message_indices` recovered by incremental rendering) and safe no-ops for the
+    token-level features it cannot guarantee: `bridge_to_next_turn` returns `None`
+    (the contract for "cannot prove a byte-for-byte extension", so callers fall back to
+    a full render), and `parse_response` only decodes text. Install `renderers` for
+    per-family parsing, reasoning/tool extraction, and multi-turn bridging.
+    """
+
+    def __init__(self, tokenizer: PreTrainedTokenizerBase):
+        self._tokenizer = tokenizer
+
+    def _apply(self, messages, *, tools=None, add_generation_prompt=False) -> list[int]:
+        return list(
+            self._tokenizer.apply_chat_template(
+                messages,
+                tools=tools,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=True,
+                return_dict=False,
+            )
+        )
+
+    def render(self, messages, *, tools=None, add_generation_prompt=False) -> RenderedTokens:
+        # Recover per-message attribution by re-rendering each prefix and taking deltas —
+        # the same technique `renderers.DefaultRenderer` uses.
+        token_ids: list[int] = []
+        message_indices: list[int] = []
+        prev_len = 0
+        for idx in range(len(messages)):
+            cur = self._apply(messages[: idx + 1], tools=tools)
+            message_indices.extend([idx] * (len(cur) - prev_len))
+            token_ids = cur
+            prev_len = len(cur)
+        if add_generation_prompt:
+            full = self._apply(messages, tools=tools, add_generation_prompt=True)
+            message_indices.extend([-1] * (len(full) - prev_len))
+            token_ids = full
+        return RenderedTokens(token_ids=token_ids, message_indices=message_indices)
+
+    def render_ids(self, messages, *, tools=None, add_generation_prompt=False) -> list[int]:
+        return self._apply(messages, tools=tools, add_generation_prompt=add_generation_prompt)
+
+    def get_stop_token_ids(self) -> list[int]:
+        return [self._tokenizer.eos_token_id]
+
+    def parse_response(self, token_ids: list[int]):
+        return {"role": "assistant", "content": self._tokenizer.decode(token_ids, skip_special_tokens=True)}
+
+    def bridge_to_next_turn(self, previous_prompt_ids, previous_completion_ids, new_messages, *, tools=None):
+        # The close token after the previous turn is unknown without per-family logic,
+        # so we cannot prove a byte-for-byte extension. Signal "fall back to full render".
+        return None
+
+
 @add_end_docstrings(INIT_TOKENIZER_DOCSTRING)
 class PreTrainedTokenizerBase(PushToHubMixin):
     """
@@ -1090,6 +1165,13 @@ class PreTrainedTokenizerBase(PushToHubMixin):
             self.chat_template = {template["name"]: template["template"] for template in self.chat_template}
 
         self.response_schema = kwargs.pop("response_schema", None)
+
+        # Optional declaration of the model's renderer (the non-Jinja, Token-In Token-Out
+        # rendering path — see `get_renderer`). A model author can ship `"renderer": "<name>"`
+        # in `tokenizer_config.json` to opt the model into multi-turn-safe rendering for RL
+        # training, where re-applying the chat template every turn drifts tokens and loses
+        # per-turn boundaries.
+        self._renderer = kwargs.pop("renderer", None)
 
         model_specific_tokens = {**auto_model_specific_tokens, **explicit_model_specific_tokens}
         if model_specific_tokens:
@@ -2090,6 +2172,8 @@ class PreTrainedTokenizerBase(PushToHubMixin):
         tokenizer_config["tokenizer_class"] = tokenizer_class
         if getattr(self, "_auto_map", None) is not None:
             tokenizer_config["auto_map"] = self._auto_map
+        if self._renderer is not None:
+            tokenizer_config["renderer"] = self._renderer
         if getattr(self, "_processor_class", None) is not None:
             tokenizer_config["processor_class"] = self._processor_class
         tokenizer_config.pop("files_loaded", None)
@@ -3273,6 +3357,111 @@ class PreTrainedTokenizerBase(PushToHubMixin):
                 )
 
         return chat_template
+
+    def get_renderer(self, renderer: str | object | None = None, *, trust_remote_code: bool = False):
+        """
+        Resolve a *renderer* for this tokenizer — a Python object that renders messages to token ids,
+        parses sampled token ids back to structured messages, and extends a multi-turn rollout without
+        re-encoding model-sampled history (Token-In, Token-Out). This is an opt-in, non-Jinja alternative
+        to [`~PreTrainedTokenizerBase.apply_chat_template`] aimed at multi-turn RL training and serving,
+        where re-rendering the message list every turn drifts tokens and loses per-turn boundaries.
+
+        Renderers are provided by the optional [`renderers`](https://github.com/PrimeIntellect-ai/renderers)
+        package. When it is not installed, this returns a built-in fallback that wraps
+        `apply_chat_template` (no per-family logic, no multi-turn bridge).
+
+        Resolution order (first hit wins):
+
+        1. An explicit `renderer` argument (a renderer name string, or an already-constructed renderer object).
+        2. A `"renderer"` declaration in the tokenizer config (resolved against the installed `renderers`
+           registry), or an `auto_map["AutoRenderer"]` entry pointing at custom Hub code (requires
+           `trust_remote_code=True`).
+        3. The installed `renderers` package's own model→renderer auto-resolution.
+        4. A built-in fallback wrapping `apply_chat_template`.
+
+        Args:
+            renderer (`str` or renderer object, *optional*):
+                A renderer name to construct, or an already-built renderer object to return as-is.
+            trust_remote_code (`bool`, *optional*, defaults to `False`):
+                Whether to allow loading a renderer defined in custom code on the Hub via
+                `auto_map["AutoRenderer"]`.
+
+        Returns:
+            A renderer object implementing the `renderers.Renderer` protocol (`render_ids`,
+            `parse_response`, `get_stop_token_ids`, `bridge_to_next_turn`), or the built-in fallback.
+        """
+        # An already-constructed renderer object is returned untouched.
+        if renderer is not None and not isinstance(renderer, str):
+            return renderer
+
+        if not is_renderers_available():
+            return _DefaultJinjaRenderer(self)
+
+        from renderers import config_from_name, create_renderer
+
+        # 1. Explicit name argument.
+        if isinstance(renderer, str):
+            return create_renderer(self, config_from_name(renderer))
+
+        # 2. Hub declaration on the tokenizer config: a plain "renderer" name, or custom
+        #    code referenced via auto_map["AutoRenderer"] (loaded only with trust_remote_code).
+        if self._renderer is not None:
+            return create_renderer(self, config_from_name(self._renderer))
+
+        auto_map = getattr(self, "_auto_map", None) or {}
+        if "AutoRenderer" in auto_map:
+            if not trust_remote_code:
+                raise ValueError(
+                    f"Loading the renderer for {self.name_or_path} requires custom code defined in its "
+                    "repository (`auto_map['AutoRenderer']`). Pass `trust_remote_code=True` to allow this."
+                )
+            from .dynamic_module_utils import get_class_from_dynamic_module
+
+            class_ref = auto_map["AutoRenderer"]
+            class_ref = class_ref[0] if isinstance(class_ref, (list, tuple)) else class_ref
+            renderer_cls = get_class_from_dynamic_module(class_ref, self.name_or_path)
+            return renderer_cls(self)
+
+        # 3. Let `renderers` auto-resolve from the tokenizer's name (its MODEL_RENDERER_MAP),
+        #    falling back to its own DefaultRenderer for unknown models.
+        return create_renderer(self)
+
+    def render_conversation(
+        self,
+        conversation: list[dict],
+        tools: list[dict] | None = None,
+        add_generation_prompt: bool = False,
+        renderer: str | object | None = None,
+        *,
+        trust_remote_code: bool = False,
+    ):
+        """
+        Render a conversation to token ids using a [renderer](`~PreTrainedTokenizerBase.get_renderer`)
+        rather than the Jinja chat template.
+
+        Unlike [`~PreTrainedTokenizerBase.apply_chat_template`], this returns the renderer's
+        `RenderedTokens` (or the fallback's), which carries `token_ids` **and** a per-token
+        `message_indices` array attributing each token to its source message (`-1` for structural
+        scaffolding) — enough to build a per-token loss mask in a single render, without
+        `{% generation %}` markers.
+
+        Args:
+            conversation (`list[dict]`):
+                A list of `{"role": ..., "content": ...}` messages.
+            tools (`list[dict]`, *optional*):
+                Tools available to the model, as JSON Schema (see `apply_chat_template`).
+            add_generation_prompt (`bool`, *optional*, defaults to `False`):
+                Whether to append the generation prompt that opens the next assistant turn.
+            renderer (`str` or renderer object, *optional*):
+                Override renderer resolution (see [`~PreTrainedTokenizerBase.get_renderer`]).
+            trust_remote_code (`bool`, *optional*, defaults to `False`):
+                Forwarded to [`~PreTrainedTokenizerBase.get_renderer`].
+
+        Returns:
+            The renderer's `RenderedTokens` object (`token_ids`, `message_indices`).
+        """
+        resolved = self.get_renderer(renderer, trust_remote_code=trust_remote_code)
+        return resolved.render(conversation, tools=tools, add_generation_prompt=add_generation_prompt)
 
     def save_chat_templates(
         self,
