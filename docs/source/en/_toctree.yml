@@ -152,6 +152,8 @@
       title: Writing a chat template
     - local: chat_response_parsing
       title: Response parsing
+    - local: renderers
+      title: Renderers
     title: Chat with models
   - isExpanded: false
     sections:
