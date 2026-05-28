@@ -1036,8 +1036,12 @@ class _DefaultJinjaRenderer:
         return {"role": "assistant", "content": self._tokenizer.decode(token_ids, skip_special_tokens=True)}
 
     def bridge_to_next_turn(self, previous_prompt_ids, previous_completion_ids, new_messages, *, tools=None):
-        # The close token after the previous turn is unknown without per-family logic,
-        # so we cannot prove a byte-for-byte extension. Signal "fall back to full render".
+        # Without per-family logic we cannot prove a byte-for-byte extension. A generic
+        # apply_chat_template delta (linear TITO) is unsafe here: a dummy-diff check verifies prefix
+        # preservation for a dummy, not for the actual rollout, so position-dependent templates (e.g.
+        # DeepSeek-V3's first-vs-later tool output) would pass the check yet emit the wrong delta.
+        # Decline instead; the caller falls back to a full (correct) re-render. The O(1) bridge is the
+        # job of a per-family renderer, which has the context to do it safely.
         return None
 
 
