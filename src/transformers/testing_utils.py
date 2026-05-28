@@ -138,6 +138,7 @@ from .utils import (
     is_pytorch_quantization_available,
     is_quark_available,
     is_qutlass_available,
+    is_renderers_available,
     is_rjieba_available,
     is_sacremoses_available,
     is_schedulefree_available,
@@ -1588,6 +1589,14 @@ def require_mistral_common(test_case):
     Decorator marking a test that requires mistral-common. These tests are skipped when mistral-common isn't available.
     """
     return unittest.skipUnless(is_mistral_common_available(), "test requires mistral-common")(test_case)
+
+
+def require_renderers(test_case):
+    """
+    Decorator marking a test that requires the renderers package. These tests are skipped when renderers isn't
+    available.
+    """
+    return unittest.skipUnless(is_renderers_available(), "test requires renderers")(test_case)
 
 
 def get_gpu_count():

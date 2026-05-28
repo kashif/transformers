@@ -192,6 +192,7 @@ from .import_utils import (
     is_quanto_greater,
     is_quark_available,
     is_qutlass_available,
+    is_renderers_available,
     is_rich_available,
     is_rjieba_available,
     is_rocm_platform,

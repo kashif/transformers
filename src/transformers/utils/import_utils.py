@@ -1375,6 +1375,11 @@ def is_mistral_common_available() -> bool:
 
 
 @lru_cache
+def is_renderers_available() -> bool:
+    return _is_package_available("renderers")[0]
+
+
+@lru_cache
 def is_pynvml_available() -> bool:
     return _is_package_available("pynvml")[0]
 
