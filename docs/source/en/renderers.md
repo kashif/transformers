@@ -64,7 +64,9 @@ per-family bridge that extends the sampled stream verbatim (or declines, so the 
 >>> prompt_ids = renderer.render_ids(  # doctest: +SKIP
 ...     [{"role": "user", "content": "What is 2+2?"}], add_generation_prompt=True
 ... )
->>> # Feed prompt_ids to a Token-In, Token-Out endpoint; it returns the sampled completion_ids.
+>>> # Sample from a Token-In, Token-Out endpoint, stopping on the renderer's stop tokens; then parse
+>>> # the sampled ids straight back into a structured message — nothing the policy produced is re-encoded.
+>>> stop_token_ids = renderer.get_stop_token_ids()  # doctest: +SKIP
 >>> parsed = renderer.parse_response(completion_ids)  # doctest: +SKIP
 ```
 
@@ -98,6 +100,19 @@ For the next turn, extend the previous sampled stream instead of re-rendering th
 
 `bridge_to_next_turn` guarantees its result starts with `previous_prompt_ids + previous_completion_ids` byte-for-byte.
 If a per-family renderer cannot prove that (or none is installed), it returns `None` and you fall back to a full render.
+
+## Multi-turn and tree-structured rollouts
+
+Modern RL rollouts are rarely a single linear trajectory. A tool loop alternates assistant and tool turns; tree
+search and best-of-N branch a shared prefix into several continuations; compaction, sub-agents, and models that strip
+past `<think>` blocks make the history non-contiguous — so the tokens the policy sampled are no longer one growing
+buffer. The renderer keeps every branch correct rather than the linear case only: `bridge_to_next_turn` extends each
+sampled continuation verbatim, and `render`'s per-token `message_indices` / `sampled_mask` give the loss mask for each
+segment. Assembling those segments into training examples — one contiguous sequence for a linear rollout, or several
+for a branched or compacted one (dynamic sequence counts per rollout) — is the trainer's job; the renderer's contract
+is only that each segment's tokens are exactly what the policy produced, with no re-encoding and no silent drift,
+whatever the branch structure. That is the guarantee a chat template cannot give, and why it does not generalize from
+single-turn inference to multi-turn, tree-structured RL.
 
 ## Rendering with per-token attribution
 
