@@ -158,6 +158,34 @@ class RendererTest(unittest.TestCase):
         prev = list(prompt_ids) + list(completion_ids)
         self.assertEqual(bridged_ids[: len(prev)], prev, "bridge must extend the sampled stream verbatim")
 
+    def test_full_token_in_token_out_loop_is_reachable(self):
+        # The whole renderer protocol — not just render — is usable from the tokenizer entry point:
+        # render_ids -> get_stop_token_ids -> parse_response -> bridge_to_next_turn, the complete
+        # TITO loop a multi-turn RL trainer drives.
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+        renderer = tokenizer.get_renderer()
+
+        prompt_ids = renderer.render_ids([{"role": "user", "content": "hi"}], add_generation_prompt=True)
+        self.assertGreater(len(prompt_ids), 0)
+        self.assertIn(tokenizer.eos_token_id, renderer.get_stop_token_ids())
+
+        # Treat the rendered assistant turn as a "sampled" completion and round-trip it.
+        full = renderer.render_ids([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}])
+        completion_ids = full[len(prompt_ids) :]
+        parsed = renderer.parse_response(completion_ids)
+        self.assertEqual(parsed.content, "hello")
+
+    def test_render_conversation_exposes_rich_rendered_tokens(self):
+        # With renderers installed, render_conversation returns the renderer's own RenderedTokens,
+        # so the richer per-token signals RL training needs (e.g. sampled_mask for loss/length
+        # penalties, message_roles) are available through the tokenizer entry point, not only token ids.
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+        rendered = tokenizer.render_conversation(
+            [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+        )
+        for field in ("token_ids", "message_indices", "sampled_mask", "message_roles"):
+            self.assertTrue(hasattr(rendered, field), f"RenderedTokens should expose {field}")
+
     def test_renderer_declaration_round_trips_and_overrides_auto_resolution(self):
         # A model author can declare a renderer in tokenizer_config.json. It must survive a
         # save/load round-trip and take precedence over name-based auto-resolution.
