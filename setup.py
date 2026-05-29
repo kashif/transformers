@@ -120,6 +120,7 @@ _deps = [
     "pytest-order",
     "python>=3.10.0",
     "regex>=2025.10.22",
+    "renderers>=0.1.8",
     "rhoknp>=1.1.0,<1.3.1",
     "rjieba",
     "rouge-score!=0.0.7,!=0.0.8,!=0.1,!=0.1.1",
@@ -190,6 +191,7 @@ extras["kernels"] = deps_list("kernels")
 extras["sentencepiece"] = deps_list("sentencepiece", "protobuf")
 extras["tiktoken"] = deps_list("tiktoken", "blobfile")
 extras["mistral-common"] = deps_list("mistral-common[image]")
+extras["renderers"] = deps_list("renderers")
 extras["chat_template"] = deps_list("jinja2", "jmespath")
 extras["sklearn"] = deps_list("scikit-learn")
 extras["accelerate"] = deps_list("accelerate")
@@ -240,7 +242,7 @@ extras["testing"] = (
     + extras["sentencepiece"]
     + extras["serving"]
 )
-extras["testing"] += extras["mistral-common"]
+extras["testing"] += extras["mistral-common"] + extras["renderers"]
 
 extras["deepspeed-testing"] = extras["deepspeed"] + extras["testing"] + extras["optuna"] + extras["sentencepiece"]
 extras["all"] = (
@@ -255,7 +257,7 @@ extras["all"] = (
     + extras["chat_template"]
     + extras["num2words"]
 )
-extras["all"] += extras["mistral-common"]
+extras["all"] += extras["mistral-common"] + extras["renderers"]
 
 extras["dev"] = extras["all"] + extras["testing"] + extras["ja"] + extras["sklearn"]
 
