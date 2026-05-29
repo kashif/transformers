@@ -68,6 +68,7 @@ class RendererFallbackTest(unittest.TestCase):
 
     def test_falls_back_to_builtin_when_renderers_unavailable(self):
         original = tokenization_utils_base.is_renderers_available
+        original_renderer = self.tokenizer._renderer
         tokenization_utils_base.is_renderers_available = lambda: False
         try:
             renderer = self.tokenizer.get_renderer()
@@ -80,7 +81,16 @@ class RendererFallbackTest(unittest.TestCase):
                 self.tokenizer.get_renderer(strict=True)
             with self.assertRaises(ValueError):
                 self.tokenizer.get_renderer("qwen3")
+            with self.assertRaises(ValueError):
+                self.tokenizer.get_renderer({"name": "qwen3"})
+            self.tokenizer._renderer = "qwen3"
+            with self.assertRaises(ValueError):
+                self.tokenizer.get_renderer()
+            self.tokenizer._renderer = {"name": "qwen3"}
+            with self.assertRaises(ValueError):
+                self.tokenizer.get_renderer()
         finally:
+            self.tokenizer._renderer = original_renderer
             tokenization_utils_base.is_renderers_available = original
 
     def test_fallback_render_conversation_returns_aligned_message_indices(self):
@@ -122,6 +132,12 @@ class RendererTest(unittest.TestCase):
         tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
         renderer = tokenizer.get_renderer(Qwen3RendererConfig())
         self.assertEqual(type(renderer).__name__, "Qwen3Renderer")
+
+    def test_explicit_renderer_config_dict_constructs_renderer(self):
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+        renderer = tokenizer.get_renderer({"name": "qwen3", "enable_thinking": False})
+        self.assertEqual(type(renderer).__name__, "Qwen3Renderer")
+        self.assertFalse(renderer.config.enable_thinking)
 
     def test_auto_map_renderer_requires_trust_remote_code(self):
         # A model declaring its renderer via auto_map points at custom Hub code, so it loads only
@@ -262,6 +278,19 @@ class RendererTest(unittest.TestCase):
             reloaded = AutoTokenizer.from_pretrained(tmp_dir)
         self.assertEqual(reloaded._renderer, "default")
         self.assertEqual(type(reloaded.get_renderer()).__name__, "DefaultRenderer")
+
+    def test_renderer_config_dict_round_trips(self):
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+        tokenizer._renderer = {"name": "qwen3", "enable_thinking": False}
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tokenizer.save_pretrained(tmp_dir)
+            reloaded = AutoTokenizer.from_pretrained(tmp_dir)
+
+        self.assertEqual(reloaded._renderer, {"name": "qwen3", "enable_thinking": False})
+        renderer = reloaded.get_renderer(strict=True)
+        self.assertEqual(type(renderer).__name__, "Qwen3Renderer")
+        self.assertFalse(renderer.config.enable_thinking)
 
 
 class AutoRendererTest(unittest.TestCase):

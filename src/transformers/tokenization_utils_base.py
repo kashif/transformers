@@ -3364,7 +3364,7 @@ class PreTrainedTokenizerBase(PushToHubMixin):
 
     def get_renderer(
         self,
-        renderer: str | object | None = None,
+        renderer: str | dict[str, object] | object | None = None,
         *,
         strict: bool = False,
         trust_remote_code: bool = False,
@@ -3383,16 +3383,18 @@ class PreTrainedTokenizerBase(PushToHubMixin):
 
         Resolution order (first hit wins):
 
-        1. An explicit `renderer` argument (a renderer name string, renderer config, or already-constructed object).
-        2. A `"renderer"` declaration in the tokenizer config (resolved against the installed `renderers`
-           registry), or an `auto_map["AutoRenderer"]` entry pointing at custom Hub code (requires
-           `trust_remote_code=True`).
+        1. An explicit `renderer` argument (a renderer name string, renderer config dict, renderer config, or
+           already-constructed object).
+        2. A `"renderer"` declaration in the tokenizer config (a renderer name string or config dict resolved against
+           the installed `renderers` registry), or an `auto_map["AutoRenderer"]` entry pointing at custom Hub code
+           (requires `trust_remote_code=True`).
         3. The installed `renderers` package's own model→renderer auto-resolution.
         4. A built-in fallback wrapping `apply_chat_template`.
 
         Args:
-            renderer (`str`, renderer config, or renderer object, *optional*):
-                A renderer name or config to construct, or an already-built renderer object to return as-is.
+            renderer (`str`, `dict`, renderer config, or renderer object, *optional*):
+                A renderer name or config to construct, or an already-built renderer object to return as-is. Dict
+                configs must include a `"name"` field matching a registered renderer.
             strict (`bool`, *optional*, defaults to `False`):
                 Require a per-family renderer. If resolution lands on a generic `apply_chat_template`
                 fallback (the renderers `DefaultRenderer`, or the built-in one when `renderers` is not
@@ -3413,15 +3415,16 @@ class PreTrainedTokenizerBase(PushToHubMixin):
             `parse_response`, `get_stop_token_ids`, `bridge_to_next_turn`), or the built-in fallback.
         """
         if not is_renderers_available():
-            if isinstance(renderer, str):
+            if renderer is not None and not isinstance(renderer, (str, dict)):
+                # An already-constructed renderer object is returned untouched. If `renderers` is unavailable, we cannot
+                # distinguish typed renderer configs from renderer instances.
+                return renderer
+            declared_renderer = renderer if renderer is not None else self._renderer
+            if declared_renderer is not None:
                 raise ValueError(
-                    f"Cannot construct renderer {renderer!r} for {self.name_or_path}: the `renderers` package is not "
+                    f"Cannot construct renderer {declared_renderer!r} for {self.name_or_path}: the `renderers` package is not "
                     "installed. Install it with `pip install transformers[renderers]`."
                 )
-            # An already-constructed renderer object is returned untouched. If `renderers` is unavailable, we cannot
-            # distinguish renderer configs from renderer instances, so only explicit string construction is rejected.
-            if renderer is not None:
-                return renderer
             if strict:
                 raise ValueError(
                     f"No per-family renderer is available for {self.name_or_path}: the `renderers` package is not "
@@ -3430,20 +3433,39 @@ class PreTrainedTokenizerBase(PushToHubMixin):
                 )
             return _DefaultJinjaRenderer(self)
 
-        from renderers import BaseRendererConfig, DefaultRenderer, config_from_name, create_renderer
+        from renderers import (
+            AutoRendererConfig,
+            BaseRendererConfig,
+            DefaultRenderer,
+            config_from_name,
+            create_renderer,
+        )
+
+        def config_from_dict(renderer_config: dict[str, object]):
+            name = renderer_config.get("name")
+            if not isinstance(name, str):
+                raise ValueError("Renderer config dictionaries must include a string `name` field.")
+            config = AutoRendererConfig() if name == "auto" else config_from_name(name)
+            return type(config)(**renderer_config)
 
         if isinstance(renderer, str):
             # 1. Explicit name argument.
             resolved = create_renderer(self, config_from_name(renderer))
+        elif isinstance(renderer, dict):
+            # 1. Explicit config dictionary argument.
+            resolved = create_renderer(self, config_from_dict(renderer))
         elif isinstance(renderer, BaseRendererConfig):
             # 1. Explicit typed config argument.
             resolved = create_renderer(self, renderer)
         elif renderer is not None:
             # 1. Already-constructed renderer object.
             return renderer
-        elif self._renderer is not None:
+        elif isinstance(self._renderer, str):
             # 2a. Hub declaration on the tokenizer config: a plain "renderer" name.
             resolved = create_renderer(self, config_from_name(self._renderer))
+        elif isinstance(self._renderer, dict):
+            # 2a. Hub declaration on the tokenizer config: a renderer config dictionary.
+            resolved = create_renderer(self, config_from_dict(self._renderer))
         elif "AutoRenderer" in (getattr(self, "_auto_map", None) or {}):
             # 2b. Custom renderer code referenced via auto_map (loaded only with trust_remote_code).
             if not trust_remote_code:
