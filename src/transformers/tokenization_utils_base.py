@@ -3362,7 +3362,9 @@ class PreTrainedTokenizerBase(PushToHubMixin):
 
         return chat_template
 
-    def get_renderer(self, renderer: str | object | None = None, *, strict: bool = False, trust_remote_code: bool = False):
+    def get_renderer(
+        self, renderer: str | object | None = None, *, strict: bool = False, trust_remote_code: bool = False
+    ):
         """
         Resolve a *renderer* for this tokenizer — a Python object that renders messages to token ids,
         parses sampled token ids back to structured messages, and extends a multi-turn rollout without
