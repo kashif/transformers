@@ -23,7 +23,9 @@ stream verbatim instead of re-encoding it.
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
+import transformers.dynamic_module_utils as dynamic_module_utils
 import transformers.tokenization_utils_base as tokenization_utils_base
 from transformers import AutoRenderer, AutoTokenizer
 from transformers.testing_utils import require_renderers
@@ -76,6 +78,8 @@ class RendererFallbackTest(unittest.TestCase):
             # strict refuses the non-bridging fallback instead of silently returning it.
             with self.assertRaises(ValueError):
                 self.tokenizer.get_renderer(strict=True)
+            with self.assertRaises(ValueError):
+                self.tokenizer.get_renderer("qwen3")
         finally:
             tokenization_utils_base.is_renderers_available = original
 
@@ -112,6 +116,13 @@ class RendererTest(unittest.TestCase):
         # Qwen3 has a hand-coded renderer; it is not the generic apply_chat_template fallback.
         self.assertEqual(type(renderer).__name__, "Qwen3Renderer")
 
+    def test_explicit_renderer_config_constructs_renderer(self):
+        from renderers import Qwen3RendererConfig
+
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+        renderer = tokenizer.get_renderer(Qwen3RendererConfig())
+        self.assertEqual(type(renderer).__name__, "Qwen3Renderer")
+
     def test_auto_map_renderer_requires_trust_remote_code(self):
         # A model declaring its renderer via auto_map points at custom Hub code, so it loads only
         # under trust_remote_code (the same contract as a custom tokenizer/model).
@@ -131,9 +142,39 @@ class RendererTest(unittest.TestCase):
                 )
             tokenizer.name_or_path = tmp_dir
             tokenizer._auto_map = {"AutoRenderer": "rendering_stub.StubRenderer"}
-            renderer = tokenizer.get_renderer(trust_remote_code=True)
+            with patch.object(dynamic_module_utils, "HF_MODULES_CACHE", os.path.join(tmp_dir, "modules")):
+                renderer = tokenizer.get_renderer(trust_remote_code=True)
             self.assertEqual(type(renderer).__name__, "StubRenderer")
             self.assertIs(renderer.tokenizer, tokenizer)
+
+    def test_auto_map_renderer_forwards_dynamic_module_kwargs(self):
+        class StubRenderer:
+            def __init__(self, tokenizer):
+                self.tokenizer = tokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+        tokenizer._auto_map = {"AutoRenderer": "rendering_stub.StubRenderer"}
+        with patch(
+            "transformers.dynamic_module_utils.get_class_from_dynamic_module", return_value=StubRenderer
+        ) as get_class:
+            renderer = tokenizer.get_renderer(
+                trust_remote_code=True,
+                revision="abc123",
+                token="fake-token",
+                cache_dir="/tmp/hf-cache",
+                local_files_only=True,
+                code_revision="code123",
+            )
+
+        self.assertIs(renderer.tokenizer, tokenizer)
+        get_class.assert_called_once()
+        args, kwargs = get_class.call_args
+        self.assertEqual(args, ("rendering_stub.StubRenderer", tokenizer.name_or_path))
+        self.assertEqual(kwargs["revision"], "abc123")
+        self.assertEqual(kwargs["token"], "fake-token")
+        self.assertEqual(kwargs["cache_dir"], "/tmp/hf-cache")
+        self.assertTrue(kwargs["local_files_only"])
+        self.assertEqual(kwargs["code_revision"], "code123")
 
     def test_unregistered_model_uses_renderers_default(self):
         tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")

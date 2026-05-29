@@ -3363,7 +3363,12 @@ class PreTrainedTokenizerBase(PushToHubMixin):
         return chat_template
 
     def get_renderer(
-        self, renderer: str | object | None = None, *, strict: bool = False, trust_remote_code: bool = False
+        self,
+        renderer: str | object | None = None,
+        *,
+        strict: bool = False,
+        trust_remote_code: bool = False,
+        **kwargs,
     ):
         """
         Resolve a *renderer* for this tokenizer — a Python object that renders messages to token ids,
@@ -3378,7 +3383,7 @@ class PreTrainedTokenizerBase(PushToHubMixin):
 
         Resolution order (first hit wins):
 
-        1. An explicit `renderer` argument (a renderer name string, or an already-constructed renderer object).
+        1. An explicit `renderer` argument (a renderer name string, renderer config, or already-constructed object).
         2. A `"renderer"` declaration in the tokenizer config (resolved against the installed `renderers`
            registry), or an `auto_map["AutoRenderer"]` entry pointing at custom Hub code (requires
            `trust_remote_code=True`).
@@ -3386,8 +3391,8 @@ class PreTrainedTokenizerBase(PushToHubMixin):
         4. A built-in fallback wrapping `apply_chat_template`.
 
         Args:
-            renderer (`str` or renderer object, *optional*):
-                A renderer name to construct, or an already-built renderer object to return as-is.
+            renderer (`str`, renderer config, or renderer object, *optional*):
+                A renderer name or config to construct, or an already-built renderer object to return as-is.
             strict (`bool`, *optional*, defaults to `False`):
                 Require a per-family renderer. If resolution lands on a generic `apply_chat_template`
                 fallback (the renderers `DefaultRenderer`, or the built-in one when `renderers` is not
@@ -3398,16 +3403,25 @@ class PreTrainedTokenizerBase(PushToHubMixin):
             trust_remote_code (`bool`, *optional*, defaults to `False`):
                 Whether to allow loading a renderer defined in custom code on the Hub via
                 `auto_map["AutoRenderer"]`.
+            kwargs:
+                Keyword arguments forwarded to the dynamic module loader when the renderer is defined via
+                `auto_map["AutoRenderer"]` (for example `revision`, `token`, `cache_dir`, `local_files_only`, or
+                `code_revision`).
 
         Returns:
             A renderer object implementing the `renderers.Renderer` protocol (`render_ids`,
             `parse_response`, `get_stop_token_ids`, `bridge_to_next_turn`), or the built-in fallback.
         """
-        # An already-constructed renderer object is returned untouched.
-        if renderer is not None and not isinstance(renderer, str):
-            return renderer
-
         if not is_renderers_available():
+            if isinstance(renderer, str):
+                raise ValueError(
+                    f"Cannot construct renderer {renderer!r} for {self.name_or_path}: the `renderers` package is not "
+                    "installed. Install it with `pip install transformers[renderers]`."
+                )
+            # An already-constructed renderer object is returned untouched. If `renderers` is unavailable, we cannot
+            # distinguish renderer configs from renderer instances, so only explicit string construction is rejected.
+            if renderer is not None:
+                return renderer
             if strict:
                 raise ValueError(
                     f"No per-family renderer is available for {self.name_or_path}: the `renderers` package is not "
@@ -3416,11 +3430,17 @@ class PreTrainedTokenizerBase(PushToHubMixin):
                 )
             return _DefaultJinjaRenderer(self)
 
-        from renderers import DefaultRenderer, config_from_name, create_renderer
+        from renderers import BaseRendererConfig, DefaultRenderer, config_from_name, create_renderer
 
         if isinstance(renderer, str):
             # 1. Explicit name argument.
             resolved = create_renderer(self, config_from_name(renderer))
+        elif isinstance(renderer, BaseRendererConfig):
+            # 1. Explicit typed config argument.
+            resolved = create_renderer(self, renderer)
+        elif renderer is not None:
+            # 1. Already-constructed renderer object.
+            return renderer
         elif self._renderer is not None:
             # 2a. Hub declaration on the tokenizer config: a plain "renderer" name.
             resolved = create_renderer(self, config_from_name(self._renderer))
@@ -3435,7 +3455,21 @@ class PreTrainedTokenizerBase(PushToHubMixin):
 
             class_ref = self._auto_map["AutoRenderer"]
             class_ref = class_ref[0] if isinstance(class_ref, (list, tuple)) else class_ref
-            resolved = get_class_from_dynamic_module(class_ref, self.name_or_path)(self)
+            dynamic_module_kwargs = {
+                key: kwargs[key]
+                for key in (
+                    "cache_dir",
+                    "force_download",
+                    "proxies",
+                    "token",
+                    "revision",
+                    "local_files_only",
+                    "repo_type",
+                    "code_revision",
+                )
+                if key in kwargs
+            }
+            resolved = get_class_from_dynamic_module(class_ref, self.name_or_path, **dynamic_module_kwargs)(self)
         else:
             # 3. Let `renderers` auto-resolve from the tokenizer's name (its MODEL_RENDERER_MAP),
             #    falling back to its own DefaultRenderer for unknown models.
@@ -3664,7 +3698,7 @@ def find_sentencepiece_model_file(pretrained_model_name_or_path, **kwargs):
             entries = list_repo_tree(
                 repo_id=pretrained_model_name_or_path,
                 revision=kwargs.get("revision"),
-                path_in_repo=subfolder if subfolder else None,
+                path_in_repo=subfolder or None,
                 recursive=False,
                 token=kwargs.get("token"),
             )

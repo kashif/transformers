@@ -54,8 +54,8 @@ class AutoRenderer:
         Args:
             pretrained_model_name_or_path (`str` or `os.PathLike`):
                 A model id of a model hosted on the Hub, or a path to a directory containing tokenizer files.
-            renderer (`str` or renderer object, *optional*):
-                Override renderer resolution with a renderer name to construct, or an already-built renderer object.
+            renderer (`str`, renderer config, or renderer object, *optional*):
+                Override renderer resolution with a renderer name or config to construct, or an already-built object.
             strict (`bool`, *optional*, defaults to `False`):
                 Require a per-family renderer and raise if only the generic `apply_chat_template` fallback is
                 available. Recommended for multi-turn RL training. See [`~PreTrainedTokenizerBase.get_renderer`].
@@ -78,4 +78,4 @@ class AutoRenderer:
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, *inputs, trust_remote_code=trust_remote_code, **kwargs
         )
-        return tokenizer.get_renderer(renderer, strict=strict, trust_remote_code=trust_remote_code)
+        return tokenizer.get_renderer(renderer, strict=strict, trust_remote_code=trust_remote_code, **kwargs)
