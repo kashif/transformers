@@ -17,10 +17,10 @@ non-Jinja rendering path backed by the ``renderers`` package.
 
 The multi-turn ``bridge_to_next_turn`` case exercises the property that the Jinja
 ``apply_chat_template`` path cannot guarantee: a per-family renderer extends a sampled token
-stream verbatim instead of re-encoding it. Adapted from
-https://gist.github.com/mikasenghaas/e336d15761cf49af5e4eb662356a5d78.
+stream verbatim instead of re-encoding it.
 """
 
+import os
 import tempfile
 import unittest
 
@@ -111,6 +111,29 @@ class RendererTest(unittest.TestCase):
         renderer = tokenizer.get_renderer()
         # Qwen3 has a hand-coded renderer; it is not the generic apply_chat_template fallback.
         self.assertEqual(type(renderer).__name__, "Qwen3Renderer")
+
+    def test_auto_map_renderer_requires_trust_remote_code(self):
+        # A model declaring its renderer via auto_map points at custom Hub code, so it loads only
+        # under trust_remote_code (the same contract as a custom tokenizer/model).
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+        tokenizer._auto_map = {"AutoRenderer": "rendering_stub.StubRenderer"}
+        with self.assertRaises(ValueError):
+            tokenizer.get_renderer()
+
+    def test_auto_map_renderer_loaded_from_repo_code(self):
+        # The renderer ships as rendering_<model>.py on the repo and is loaded via the dynamic-module
+        # mechanism — exactly how a custom modeling_<model>.py is loaded.
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with open(os.path.join(tmp_dir, "rendering_stub.py"), "w") as f:
+                f.write(
+                    "class StubRenderer:\n    def __init__(self, tokenizer):\n        self.tokenizer = tokenizer\n"
+                )
+            tokenizer.name_or_path = tmp_dir
+            tokenizer._auto_map = {"AutoRenderer": "rendering_stub.StubRenderer"}
+            renderer = tokenizer.get_renderer(trust_remote_code=True)
+            self.assertEqual(type(renderer).__name__, "StubRenderer")
+            self.assertIs(renderer.tokenizer, tokenizer)
 
     def test_unregistered_model_uses_renderers_default(self):
         tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
@@ -208,9 +231,7 @@ class AutoRendererTest(unittest.TestCase):
     @require_renderers
     def test_from_pretrained_resolves_per_family(self):
         self.assertEqual(type(AutoRenderer.from_pretrained("Qwen/Qwen3-0.6B")).__name__, "Qwen3Renderer")
-        self.assertEqual(
-            type(AutoRenderer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")).__name__, "DefaultRenderer"
-        )
+        self.assertEqual(type(AutoRenderer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")).__name__, "DefaultRenderer")
 
 
 if __name__ == "__main__":
