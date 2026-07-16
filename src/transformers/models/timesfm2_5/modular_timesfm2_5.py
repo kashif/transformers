@@ -76,6 +76,9 @@ class TimesFm2_5Config(TimesFmConfig):
         Whether to apply flip-invariance averaging during forecasting.
     infer_is_positive (`bool`, *optional*, defaults to `True`):
         Whether to clamp forecasts to non-negative values when the input minimum is non-negative.
+    fix_quantile_crossing (`bool`, *optional*, defaults to `False`):
+        Whether to enforce monotonically ordered quantiles by clamping each quantile band outward from
+        the median so that lower quantiles never exceed higher ones.
 
     Example:
 
@@ -99,6 +102,7 @@ class TimesFm2_5Config(TimesFmConfig):
     use_continuous_quantile_head: bool = True
     force_flip_invariance: bool = True
     infer_is_positive: bool = True
+    fix_quantile_crossing: bool = False
     max_position_embeddings: int = 16384
     rope_parameters: RopeParameters | dict | None = None
 
@@ -737,6 +741,13 @@ class TimesFm2_5ModelForPrediction(TimesFmModelForPrediction):
                     - quantile_spreads[:, :max_quantile_horizon, median_index]
                     + full_forecast[:, :max_quantile_horizon, median_index]
                 )
+
+        if self.config.fix_quantile_crossing:
+            # Enforce monotonic quantiles by clamping outward from the median (index 0 is the mean).
+            for idx in range(median_index - 1, 0, -1):
+                full_forecast[:, :, idx] = torch.minimum(full_forecast[:, :, idx], full_forecast[:, :, idx + 1])
+            for idx in range(median_index + 1, full_forecast.shape[-1]):
+                full_forecast[:, :, idx] = torch.maximum(full_forecast[:, :, idx], full_forecast[:, :, idx - 1])
 
         full_predictions = self.model._revin(full_forecast, mu_global, sigma_global, reverse=True)
         decode_index = min(self.config.decode_index, full_predictions.shape[-1] - 1)

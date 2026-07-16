@@ -191,6 +191,26 @@ class TimesFm2_5ModelTest(ModelTesterMixin, unittest.TestCase):
                 naive = naive_rollout(horizon)
             torch.testing.assert_close(cached, naive, atol=1e-4, rtol=1e-4)
 
+    def test_fix_quantile_crossing(self):
+        model, past_values = self._get_autoregressive_model_and_inputs()
+        horizon = 2 * model.config.horizon_length
+
+        model.config.fix_quantile_crossing = False
+        with torch.no_grad():
+            unfixed = model(past_values=past_values, horizon=horizon).full_predictions
+
+        model.config.fix_quantile_crossing = True
+        with torch.no_grad():
+            fixed = model(past_values=past_values, horizon=horizon).full_predictions
+
+        # Quantile channels (1..q-1, excluding the mean at index 0) must be monotonically non-decreasing.
+        quantile_bands = fixed[..., 1:]
+        diffs = quantile_bands[..., 1:] - quantile_bands[..., :-1]
+        self.assertGreaterEqual(diffs.min().item(), -1e-6, "quantiles still cross after fix_quantile_crossing")
+        # The median channel is a fixed point of the clamp, so the point forecast is unchanged.
+        median = min(model.config.decode_index, unfixed.shape[-1] - 1)
+        torch.testing.assert_close(fixed[..., median], unfixed[..., median])
+
     @unittest.skip(reason="FA backend not yet supported because of forced masks")
     def test_sdpa_can_dispatch_on_flash(self):
         pass

@@ -49,6 +49,9 @@ class TimesFm2_5Config(PreTrainedConfig):
         Whether to apply flip-invariance averaging during forecasting.
     infer_is_positive (`bool`, *optional*, defaults to `True`):
         Whether to clamp forecasts to non-negative values when the input minimum is non-negative.
+    fix_quantile_crossing (`bool`, *optional*, defaults to `False`):
+        Whether to enforce monotonically ordered quantiles by clamping each quantile band outward from
+        the median so that lower quantiles never exceed higher ones.
 
     Example:
 
@@ -87,6 +90,7 @@ class TimesFm2_5Config(PreTrainedConfig):
     use_continuous_quantile_head: bool = True
     force_flip_invariance: bool = True
     infer_is_positive: bool = True
+    fix_quantile_crossing: bool = False
     max_position_embeddings: int = 16384
     rope_parameters: RopeParameters | dict | None = None
 

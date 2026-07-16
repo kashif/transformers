@@ -871,6 +871,13 @@ class TimesFm2_5ModelForPrediction(TimesFm2_5PreTrainedModel):
                     + full_forecast[:, :max_quantile_horizon, median_index]
                 )
 
+        if self.config.fix_quantile_crossing:
+            # Enforce monotonic quantiles by clamping outward from the median (index 0 is the mean).
+            for idx in range(median_index - 1, 0, -1):
+                full_forecast[:, :, idx] = torch.minimum(full_forecast[:, :, idx], full_forecast[:, :, idx + 1])
+            for idx in range(median_index + 1, full_forecast.shape[-1]):
+                full_forecast[:, :, idx] = torch.maximum(full_forecast[:, :, idx], full_forecast[:, :, idx - 1])
+
         full_predictions = self.model._revin(full_forecast, mu_global, sigma_global, reverse=True)
         decode_index = min(self.config.decode_index, full_predictions.shape[-1] - 1)
         mean_predictions = full_predictions[:, :, decode_index]
