@@ -120,6 +120,77 @@ class TimesFm2_5ModelTest(ModelTesterMixin, unittest.TestCase):
         results = model(**inputs_dict)
         assert results.mean_predictions is not None
 
+    def _get_autoregressive_model_and_inputs(self):
+        """A config whose horizon is a multiple of the patch length so autoregressive decode is exercised."""
+        config = TimesFm2_5Config(
+            patch_length=32,
+            context_length=256,
+            horizon_length=64,  # 2 patches fed back per decode step
+            quantiles=[0.1, 0.5, 0.9],
+            output_quantile_len=128,
+            hidden_size=32,
+            intermediate_size=64,
+            head_dim=16,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+        )
+        model = TimesFm2_5ModelForPrediction(config).to(torch_device).eval()
+        past_values = [
+            torch.tensor(np.sin(np.linspace(0, 20, 256)), dtype=torch.float32, device=torch_device),
+            torch.tensor(np.cos(np.linspace(0, 13, 200)), dtype=torch.float32, device=torch_device),
+        ]
+        return model, past_values
+
+    def test_long_horizon_shape(self):
+        model, past_values = self._get_autoregressive_model_and_inputs()
+        horizon = 3 * model.config.horizon_length  # forces two autoregressive steps
+        with torch.no_grad():
+            out = model(past_values=past_values, horizon=horizon)
+        self.assertEqual(out.mean_predictions.shape, torch.Size([2, horizon]))
+        self.assertEqual(out.full_predictions.shape[:2], torch.Size([2, horizon]))
+
+    def test_default_horizon_unchanged(self):
+        # horizon == horizon_length must be byte-identical to the default (no autoregression).
+        model, past_values = self._get_autoregressive_model_and_inputs()
+        with torch.no_grad():
+            out_default = model(past_values=past_values)
+            out_explicit = model(past_values=past_values, horizon=model.config.horizon_length)
+        self.assertTrue(torch.equal(out_default.full_predictions, out_explicit.full_predictions))
+
+    def test_autoregressive_matches_naive_rollout(self):
+        # The cached autoregressive rollout must match a naive full-recompute rollout (no cache).
+        model, past_values = self._get_autoregressive_model_and_inputs()
+        inputs = [ts[-model.context_len :] for ts in past_values]
+        input_ts, input_padding = model._preprocess(inputs, context_len=model.context_len)
+        input_ts = input_ts.to(torch_device)
+        input_padding = input_padding.to(torch_device)
+        mu = input_ts.mean(dim=1, keepdim=True)
+        sigma = input_ts.std(dim=1, keepdim=True)
+        normalized_ts = model.model._revin(input_ts, mu, sigma, reverse=False)
+
+        ar_index = min(model.config.decode_index, len(model.config.quantiles))
+
+        def naive_rollout(horizon):
+            point_forecast, _, _ = model._decode_and_project(normalized_ts, input_padding)
+            steps = (horizon - 1) // model.horizon_len
+            forecasts = [point_forecast]
+            seq, pad = normalized_ts, input_padding
+            last_median = point_forecast[..., ar_index]
+            for _ in range(steps):
+                seq = torch.cat([seq, last_median], dim=1)
+                pad = torch.cat([pad, torch.zeros_like(last_median, dtype=pad.dtype)], dim=1)
+                step_forecast, _, _ = model._decode_and_project(seq, pad)
+                forecasts.append(step_forecast)
+                last_median = step_forecast[..., ar_index]
+            return torch.cat(forecasts, dim=1)[:, :horizon, :]
+
+        for horizon in (2 * model.horizon_len, 3 * model.horizon_len):
+            with torch.no_grad():
+                cached, _, _ = model._autoregressive_forecast(normalized_ts, input_padding, horizon)
+                naive = naive_rollout(horizon)
+            torch.testing.assert_close(cached, naive, atol=1e-4, rtol=1e-4)
+
     @unittest.skip(reason="FA backend not yet supported because of forced masks")
     def test_sdpa_can_dispatch_on_flash(self):
         pass

@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from huggingface_hub.dataclasses import strict
 
 from ...activations import ACT2FN
+from ...cache_utils import Cache, DynamicCache
 from ...masking_utils import create_causal_mask
 from ...modeling_rope_utils import RopeParameters
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -117,10 +118,17 @@ class TimesFm2_5Output(TimesFmOutput):
         Running means computed per input patch during normalization.
     context_sigma (`torch.Tensor` of shape `(batch_size, num_patches)`):
         Running standard deviations computed per input patch during normalization.
+    past_key_values (`Cache`, *optional*):
+        Key/value cache used to speed up autoregressive decoding of long horizons.
+    running_stats (`tuple(torch.Tensor)`, *optional*):
+        Welford running statistics `(count, mean, std)` after the last input patch, used to continue
+        the per-patch normalization across autoregressive decode steps.
     """
 
     context_mu: torch.Tensor | None = None
     context_sigma: torch.Tensor | None = None
+    past_key_values: Cache | None = None
+    running_stats: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
 
 @auto_docstring
@@ -240,6 +248,8 @@ class TimesFm2_5DecoderLayer(LlamaDecoderLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -249,6 +259,7 @@ class TimesFm2_5DecoderLayer(LlamaDecoderLayer):
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            past_key_values=past_key_values,
             **kwargs,
         )
         hidden_states = self.post_attention_layernorm(hidden_states) + residual
@@ -377,6 +388,11 @@ class TimesFm2_5Model(TimesFm2_5PreTrainedModel):
         self,
         past_values: torch.Tensor,
         past_values_padding: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = None,
+        running_stats: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> TimesFm2_5Output:
         r"""
@@ -384,6 +400,19 @@ class TimesFm2_5Model(TimesFm2_5PreTrainedModel):
             Past values of the time series used as input to the model.
         past_values_padding (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Padding mask for the input. `1` indicates padded (masked) time steps, `0` indicates valid values.
+        attention_mask (`torch.Tensor` of shape `(batch_size, kv_num_patches)`, *optional*):
+            Patch-level attention mask (`1` = attend, `0` = ignore) covering the cached key/value patches. When
+            omitted it is derived from `past_values_padding`. Used to keep padded context patches masked during
+            autoregressive decoding.
+        position_ids (`torch.Tensor`, *optional*):
+            Patch position indices. When omitted they are inferred from the padding and the cache length.
+        past_key_values (`Cache`, *optional*):
+            Key/value cache used to speed up autoregressive decoding.
+        use_cache (`bool`, *optional*):
+            Whether to write the new key/value states into `past_key_values`.
+        running_stats (`tuple(torch.Tensor)`, *optional*):
+            Welford running statistics `(count, mean, std)` from a previous call, used to continue the per-patch
+            normalization across autoregressive decode steps.
         """
         batch_size, seq_len = past_values.shape
         patch_len = self.config.patch_length
@@ -395,9 +424,12 @@ class TimesFm2_5Model(TimesFm2_5PreTrainedModel):
         patched_masks = past_values_padding[:, :seq_len].view(batch_size, -1, patch_len)
         patched_masks_bool = patched_masks >= 0.5
 
-        count = past_values.new_zeros(batch_size)
-        mean = past_values.new_zeros(batch_size)
-        std = past_values.new_zeros(batch_size)
+        if running_stats is None:
+            count = past_values.new_zeros(batch_size)
+            mean = past_values.new_zeros(batch_size)
+            std = past_values.new_zeros(batch_size)
+        else:
+            count, mean, std = running_stats
         mean_history: list[torch.Tensor] = []
         std_history: list[torch.Tensor] = []
 
@@ -424,13 +456,20 @@ class TimesFm2_5Model(TimesFm2_5PreTrainedModel):
         input_embeddings = self.input_ff_layer(tokenizer_inputs)
 
         patch_padding = patched_masks_bool[..., -1]
+        past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
 
         sequence_length = input_embeddings.shape[1]
-        num_masked = patch_padding.to(torch.int32).sum(dim=-1, keepdim=True)
-        position_ids = torch.arange(sequence_length, device=input_embeddings.device).unsqueeze(0) - num_masked
+        if position_ids is None:
+            num_masked = patch_padding.to(torch.int32).sum(dim=-1, keepdim=True)
+            position_ids = (
+                torch.arange(sequence_length, device=input_embeddings.device).unsqueeze(0) + past_seen - num_masked
+            )
 
-        padding_mask = (~patch_padding).to(torch.int64)
-        attention_mask = create_causal_mask(self.config, input_embeddings, padding_mask, past_key_values=None)
+        if attention_mask is None:
+            attention_mask = (~patch_padding).to(torch.int64)
+        attention_mask = create_causal_mask(
+            self.config, input_embeddings, attention_mask, past_key_values=past_key_values, position_ids=position_ids
+        )
         position_embeddings = self.rotary_emb(input_embeddings, position_ids)
 
         hidden_states = input_embeddings
@@ -441,6 +480,8 @@ class TimesFm2_5Model(TimesFm2_5PreTrainedModel):
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
                 **kwargs,
             )
 
@@ -453,6 +494,8 @@ class TimesFm2_5Model(TimesFm2_5PreTrainedModel):
             scale=scale,
             context_mu=context_mu,
             context_sigma=context_sigma,
+            past_key_values=past_key_values,
+            running_stats=(count, mean, std),
         )
 
 
@@ -489,16 +532,28 @@ class TimesFm2_5ModelForPrediction(TimesFmModelForPrediction):
         self,
         normalized_ts: torch.Tensor,
         input_padding: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = None,
+        running_stats: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the decoder and project to point/quantile outputs.
+    ) -> tuple[torch.Tensor, torch.Tensor, TimesFm2_5Output]:
+        """Run the decoder and project the last patch to point/quantile outputs.
 
         Returns:
-            Tuple of (point_forecast, quantile_spreads), each of shape `(batch, length, num_quantiles)`.
+            Tuple of (point_forecast, quantile_spreads, model_outputs). `point_forecast` has shape
+            `(batch, horizon_length, num_quantiles)` and `quantile_spreads` has shape
+            `(batch, output_quantile_len, num_quantiles)`.
         """
         model_outputs = self.model(
             past_values=normalized_ts,
             past_values_padding=input_padding,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            running_stats=running_stats,
             **kwargs,
         )
 
@@ -528,12 +583,81 @@ class TimesFm2_5ModelForPrediction(TimesFmModelForPrediction):
 
         return point_forecast, quantile_spreads, model_outputs
 
+    def _autoregressive_forecast(
+        self,
+        normalized_ts: torch.Tensor,
+        input_padding: torch.Tensor,
+        horizon: int,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor, TimesFm2_5Output]:
+        """Roll out the forecast for `horizon` steps, feeding the median prediction back autoregressively.
+
+        A single forward pass predicts one output patch of `horizon_length` steps. For longer horizons the
+        median channel of the last patch is re-patched and fed back through the decoder, reusing a
+        [`~cache_utils.DynamicCache`] so each step only attends over the new patches. The per-patch normalization
+        statistics are carried across steps via `running_stats`.
+
+        Returns:
+            Tuple of (point_forecast, quantile_spreads, prefill_outputs). `point_forecast` has shape
+            `(batch, horizon, num_quantiles)` and `quantile_spreads` comes from the prefill pass.
+        """
+        horizon_len = self.horizon_len
+        num_decode_steps = (horizon - 1) // horizon_len
+        use_cache = num_decode_steps > 0
+        past_key_values = DynamicCache(config=self.config) if use_cache else None
+
+        point_forecast, quantile_spreads, prefill_outputs = self._decode_and_project(
+            normalized_ts, input_padding, past_key_values=past_key_values, use_cache=use_cache, **kwargs
+        )
+        if num_decode_steps == 0:
+            return point_forecast, quantile_spreads, prefill_outputs
+
+        batch_size, seq_len = normalized_ts.shape
+        patch_len = self.config.patch_length
+        num_patches_per_step = horizon_len // patch_len
+        ar_index = min(self.config.decode_index, point_forecast.shape[-1] - 1)
+
+        # Patch-level padding of the context, matching the mask that the model builds internally.
+        patched_masks_bool = input_padding[:, :seq_len].view(batch_size, -1, patch_len) >= 0.5
+        patch_padding = patched_masks_bool[..., -1]
+        num_masked = patch_padding.to(torch.int32).sum(dim=-1, keepdim=True)
+        attend_mask = (~patch_padding).to(torch.int64)
+
+        running_stats = prefill_outputs.running_stats
+        forecasts = [point_forecast]
+        last_median = point_forecast[..., ar_index]
+        step_index = torch.arange(num_patches_per_step, device=normalized_ts.device).unsqueeze(0)
+
+        for _ in range(num_decode_steps):
+            cache_len = past_key_values.get_seq_length()
+            position_ids = cache_len - num_masked + step_index
+            attend_mask = torch.cat([attend_mask, attend_mask.new_ones(batch_size, num_patches_per_step)], dim=1)
+
+            new_input = last_median
+            step_forecast, _, step_outputs = self._decode_and_project(
+                new_input,
+                new_input.new_zeros(new_input.shape, dtype=torch.long),
+                attention_mask=attend_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+                running_stats=running_stats,
+                **kwargs,
+            )
+            forecasts.append(step_forecast)
+            last_median = step_forecast[..., ar_index]
+            running_stats = step_outputs.running_stats
+
+        point_forecast = torch.cat(forecasts, dim=1)[:, :horizon, :]
+        return point_forecast, quantile_spreads, prefill_outputs
+
     @can_return_tuple
     @auto_docstring
     def forward(
         self,
         past_values: Sequence[torch.Tensor],
         window_size: int | None = None,
+        horizon: int | None = None,
         future_values: torch.Tensor | None = None,
         forecast_context_len: int | None = None,
         truncate_negative: bool | None = None,
@@ -545,6 +669,9 @@ class TimesFm2_5ModelForPrediction(TimesFmModelForPrediction):
             Past values of the time series that serves as input to the model. Each tensor is a 1D time series.
         window_size (`int`, *optional*):
             Window size of trend + residual decomposition. If `None`, decomposition is not applied.
+        horizon (`int`, *optional*):
+            Number of steps to forecast. When greater than `config.horizon_length` the model decodes
+            autoregressively. If `None`, defaults to `config.horizon_length`.
         future_values (`torch.Tensor`, *optional*):
             Optional future values used to compute the loss.
         forecast_context_len (`int`, *optional*):
@@ -564,7 +691,7 @@ class TimesFm2_5ModelForPrediction(TimesFmModelForPrediction):
         if window_size is not None:
             new_inputs: list[torch.Tensor] = []
             for ts in inputs:
-                new_inputs.extend(self._timesfm_moving_average(ts, window_size))
+                new_inputs.extend(self._timesfm2_5_moving_average(ts, window_size))
             inputs = new_inputs
 
         if truncate_negative is None:
@@ -581,10 +708,14 @@ class TimesFm2_5ModelForPrediction(TimesFmModelForPrediction):
 
         normalized_ts = self.model._revin(input_ts, mu_global, sigma_global, reverse=False)
 
-        pf_outputs, quantile_spreads, model_outputs = self._decode_and_project(normalized_ts, input_padding, **kwargs)
+        horizon = horizon or self.horizon_len
+
+        pf_outputs, quantile_spreads, model_outputs = self._autoregressive_forecast(
+            normalized_ts, input_padding, horizon, **kwargs
+        )
 
         if force_flip_invariance:
-            flipped_pf, flipped_qs, _ = self._decode_and_project(-normalized_ts, input_padding, **kwargs)
+            flipped_pf, flipped_qs, _ = self._autoregressive_forecast(-normalized_ts, input_padding, horizon, **kwargs)
 
             def _flip_quantiles(x: torch.Tensor) -> torch.Tensor:
                 return torch.cat([x[..., :1], torch.flip(x[..., 1:], dims=(-1,))], dim=-1)
@@ -592,7 +723,7 @@ class TimesFm2_5ModelForPrediction(TimesFmModelForPrediction):
             pf_outputs = (pf_outputs - _flip_quantiles(flipped_pf)) / 2
             quantile_spreads = (quantile_spreads - _flip_quantiles(flipped_qs)) / 2
 
-        horizon = min(self.horizon_len, pf_outputs.shape[1])
+        horizon = min(horizon, pf_outputs.shape[1])
         full_forecast = pf_outputs[:, :horizon, :].clone()
 
         median_index = min(self.config.decode_index, full_forecast.shape[-1] - 1)
