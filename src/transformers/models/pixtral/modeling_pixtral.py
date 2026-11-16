@@ -221,6 +221,7 @@ class PixtralAttention(nn.Module):
         return attn_output, attn_weights
 
 
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 # Copied from transformers.models.mistral.modeling_mistral.MistralMLP with Mistral->Pixtral
 class PixtralMLP(nn.Module):
     def __init__(self, config):

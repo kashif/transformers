@@ -24,6 +24,7 @@ from ... import initialization as init
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, StaticLayer
 from ...generation import GenerationMixin
+from ...integrations import use_kernel_forward_from_hub
 from ...masking_utils import create_causal_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_layers import GradientCheckpointingLayer
@@ -574,6 +575,7 @@ class MllamaTextSelfAttention(nn.Module):
         return attn_output, attn_weights
 
 
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 # Copied from transformers.models.gemma2.modeling_gemma2.Gemma2MLP with Gemma2->MllamaText
 class MllamaTextMLP(nn.Module):
     def __init__(self, config):

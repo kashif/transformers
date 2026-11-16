@@ -27,6 +27,7 @@ from huggingface_hub.dataclasses import strict
 from ...activations import ACT2FN
 from ...cache_utils import Cache
 from ...configuration_utils import PreTrainedConfig
+from ...integrations import use_kernel_forward_from_hub
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from ...modeling_utils import slice_logits_to_keep
@@ -107,9 +108,11 @@ class Qwen2_5_VLRMSNorm(LlamaRMSNorm):
     pass
 
 
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class Qwen2_5_VLMLP(nn.Module):
     def __init__(self, config, bias: bool = False):
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)

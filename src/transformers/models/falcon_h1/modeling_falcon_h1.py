@@ -826,7 +826,7 @@ class FalconH1Mixer(nn.Module):
         return contextualized_states
 
 
-@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
+@use_kernel_forward_from_hub("ScaledSwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class FalconH1MLP(nn.Module):
     def __init__(self, config: FalconH1Config):
         super().__init__()

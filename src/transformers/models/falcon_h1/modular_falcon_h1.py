@@ -26,6 +26,7 @@ from torch import nn
 
 from ... import initialization as init
 from ...cache_utils import Cache, DynamicCache
+from ...integrations import use_kernel_forward_from_hub
 from ...integrations.accelerate import force_accelerate_hooks
 from ...masking_utils import create_causal_mask, create_recurrent_attention_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
@@ -338,6 +339,7 @@ class FalconH1Mixer(BambaMixer):
         return contextualized_states
 
 
+@use_kernel_forward_from_hub("ScaledSwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class FalconH1MLP(LlamaMLP):
     def __init__(self, config: FalconH1Config):
         super().__init__(config)

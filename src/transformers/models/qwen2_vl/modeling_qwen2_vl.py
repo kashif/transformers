@@ -452,6 +452,7 @@ class Qwen2VLVisionBlock(GradientCheckpointingLayer):
         return hidden_states
 
 
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 # Copied from transformers.models.qwen2.modeling_qwen2.Qwen2MLP
 class Qwen2MLP(nn.Module):
     def __init__(self, config):

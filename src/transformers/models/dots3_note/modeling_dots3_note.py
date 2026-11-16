@@ -277,6 +277,7 @@ class Dots3NoteTextIndexer(nn.Module):
         return index_scores.topk(topk, dim=-1).indices.to(torch.int32)  # [B, S, topk]
 
 
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class Dots3NoteTextMLP(nn.Module):
     def __init__(self, config, intermediate_size=None):
         super().__init__()
@@ -1274,6 +1275,7 @@ class Dots3NoteVisionPatchEmbed(nn.Module):
         return self.norm(hidden_states)
 
 
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class Dots3NoteVisionMLP(nn.Module):
     def __init__(self, config):
         super().__init__()

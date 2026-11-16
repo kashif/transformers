@@ -20,7 +20,7 @@ from torch import nn
 from ... import initialization as init
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, DynamicSlidingWindowLayer
-from ...integrations import use_experts_implementation
+from ...integrations import use_experts_implementation, use_kernel_forward_from_hub
 from ...masking_utils import create_sliding_window_causal_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_layers import GradientCheckpointingLayer
@@ -926,6 +926,7 @@ class DeepseekV4HyperHead(nn.Module):
         return (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
 
 
+@use_kernel_forward_from_hub("ClampedSwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class DeepseekV4MLP(LlamaMLP):
     def __init__(self, config: DeepseekV4Config):
         super().__init__(config)

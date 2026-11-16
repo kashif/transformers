@@ -83,7 +83,7 @@ class Glm5NextTextRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
-@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
+@use_kernel_forward_from_hub("ClampedSwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class Glm5NextTextMLP(nn.Module):
     def __init__(self, config, intermediate_size=None):
         super().__init__()
@@ -1525,9 +1525,11 @@ class Glm5NextTextModel(Glm5NextPreTrainedModel):
         return MoeModelOutputWithPast(last_hidden_state=hidden_states, cache=cache)
 
 
+@use_kernel_forward_from_hub("ClampedSwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class Glm5NextVisionMLP(nn.Module):
     def __init__(self, config, bias: bool = True):
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)

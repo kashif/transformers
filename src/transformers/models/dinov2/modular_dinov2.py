@@ -24,7 +24,7 @@ from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BackboneOutput, BaseModelOutput, BaseModelOutputWithPooling, ImageClassifierOutput
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, torch_int
-from ...utils.generic import can_return_tuple, merge_with_config_defaults
+from ...utils.generic import can_return_tuple, merge_with_config_defaults, no_inherit_decorator
 from ...utils.output_capturing import capture_outputs
 from ..beit.modeling_beit import BeitEmbeddings
 from ..bert.modeling_bert import eager_attention_forward  # noqa: F401
@@ -124,6 +124,7 @@ class Dinov2MLP(ViTMLP):
         self.fc2 = nn.Linear(int(config.hidden_size * config.mlp_ratio), config.hidden_size)
 
 
+@no_inherit_decorator
 class Dinov2SwiGLUFFN(LlamaMLP):
     def __init__(self, config) -> None:
         nn.Module.__init__(self)

@@ -30,7 +30,7 @@ from ... import initialization as init
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
-from ...integrations import use_kernel_func_from_hub_with_fallback, use_kernelized_func
+from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub_with_fallback, use_kernelized_func
 from ...integrations.accelerate import force_accelerate_hooks
 from ...masking_utils import create_causal_mask, create_recurrent_attention_mask
 from ...modeling_layers import GradientCheckpointingLayer
@@ -617,6 +617,7 @@ class ZambaMambaMixer(nn.Module):
         return contextualized_states
 
 
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 # Copied from transformers.models.mistral.modeling_mistral.MistralMLP with Mistral->Zamba
 class ZambaMLP(nn.Module):
     def __init__(self, config):

@@ -26,6 +26,7 @@ from ... import initialization as init
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
+from ...integrations import use_kernel_forward_from_hub
 from ...masking_utils import create_causal_mask, create_chunked_causal_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_layers import GradientCheckpointingLayer
@@ -85,6 +86,7 @@ class Llama4TextExperts(nn.Module):
 
 
 # Phi3MLP
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class Llama4TextMLP(nn.Module):
     def __init__(self, config, intermediate_size=None):
         super().__init__()

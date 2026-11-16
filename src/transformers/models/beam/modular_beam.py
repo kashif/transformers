@@ -33,6 +33,7 @@ from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel, slice_lo
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring
 from ...utils.deprecation import deprecate_kwarg
+from ...utils.generic import no_inherit_decorator
 from ...utils.output_capturing import OutputRecorder
 from ..deepseek_v3.modeling_deepseek_v3 import (
     DeepseekV3ForCausalLM,
@@ -244,6 +245,7 @@ class BeamExperts(DeepseekV4Experts):
         return (self.act_fn(gate.float()) * up.float()).to(gate.dtype)
 
 
+@no_inherit_decorator
 class BeamMLP(Qwen3MoeMLP):
     def forward(self, x):
         gate = self.gate_proj(x)

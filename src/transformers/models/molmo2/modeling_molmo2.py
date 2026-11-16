@@ -330,6 +330,7 @@ class Molmo2Attention(nn.Module):
         return attn_output, attn_weights
 
 
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class Molmo2MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -574,6 +575,7 @@ class Molmo2VisionModel(Molmo2PreTrainedModel):
         )
 
 
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class Molmo2ImageProjectorMLP(nn.Module):
     def __init__(self, config: Molmo2AdapterConfig):
         super().__init__()

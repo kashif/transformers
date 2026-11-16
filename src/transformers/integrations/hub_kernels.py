@@ -432,6 +432,45 @@ if is_kernels_available():
                         version=3,
                     ),
                 },
+                "rocm": {
+                    Mode.TRAINING | Mode.TORCH_COMPILE: LayerRepository(
+                        repo_id="kernels-community/liger-kernels",
+                        layer_name="LigerTiledSwiGLUMLP",
+                        version=3,
+                    ),
+                },
+            },
+            "ScaledSwiGLUMLP": {
+                "cuda": {
+                    Mode.TRAINING | Mode.TORCH_COMPILE: LayerRepository(
+                        repo_id="kernels-community/liger-kernels",
+                        layer_name="LigerTiledScaledSwiGLUMLP",
+                        version=4,
+                    ),
+                },
+                "rocm": {
+                    Mode.TRAINING | Mode.TORCH_COMPILE: LayerRepository(
+                        repo_id="kernels-community/liger-kernels",
+                        layer_name="LigerTiledScaledSwiGLUMLP",
+                        version=4,
+                    ),
+                },
+            },
+            "ClampedSwiGLUMLP": {
+                "cuda": {
+                    Mode.TRAINING | Mode.TORCH_COMPILE: LayerRepository(
+                        repo_id="kernels-community/liger-kernels",
+                        layer_name="LigerTiledClampedSwiGLUMLP",
+                        version=4,
+                    ),
+                },
+                "rocm": {
+                    Mode.TRAINING | Mode.TORCH_COMPILE: LayerRepository(
+                        repo_id="kernels-community/liger-kernels",
+                        layer_name="LigerTiledClampedSwiGLUMLP",
+                        version=4,
+                    ),
+                },
             },
             "GeGLUMLP": {
                 "cuda": {
@@ -440,6 +479,13 @@ if is_kernels_available():
                         layer_name="LigerGEGLUMLP",
                         version=3,
                     ),
+                    Mode.TRAINING | Mode.TORCH_COMPILE: LayerRepository(
+                        repo_id="kernels-community/liger-kernels",
+                        layer_name="LigerTiledGEGLUMLP",
+                        version=3,
+                    ),
+                },
+                "rocm": {
                     Mode.TRAINING | Mode.TORCH_COMPILE: LayerRepository(
                         repo_id="kernels-community/liger-kernels",
                         layer_name="LigerTiledGEGLUMLP",

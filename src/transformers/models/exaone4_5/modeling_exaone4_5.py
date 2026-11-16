@@ -317,9 +317,11 @@ class Exaone4_5_VisionAttention(nn.Module):
         return self.proj(attn_output)
 
 
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class Exaone4_5_MLP(nn.Module):
     def __init__(self, config, bias: bool = False):
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)

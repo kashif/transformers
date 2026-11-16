@@ -318,6 +318,7 @@ class Glm5NextTextRMSNorm(LlamaRMSNorm):
     pass
 
 
+@use_kernel_forward_from_hub("ClampedSwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class Glm5NextTextMLP(Qwen2MoeMLP):
     def __init__(self, config, intermediate_size=None):
         super().__init__(config)
@@ -1379,6 +1380,7 @@ class Glm5NextTextModel(Glm5NextPreTrainedModel):
         return MoeModelOutputWithPast(last_hidden_state=hidden_states, cache=cache)
 
 
+@use_kernel_forward_from_hub("ClampedSwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class Glm5NextVisionMLP(GlmOcrVisionMlp):
     def __init__(self, config, bias: bool = True):
         super().__init__(config, bias=bias)

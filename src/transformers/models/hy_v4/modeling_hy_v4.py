@@ -483,6 +483,7 @@ class HYV4Attention(nn.Module):
         return self.o_proj(attn_output), attn_weights, topk_indices
 
 
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class HYV4MLP(nn.Module):
     def __init__(self, config, intermediate_size=None):
         super().__init__()

@@ -1103,9 +1103,11 @@ class Qwen2_5OmniRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class Qwen2_5OmniMLP(nn.Module):
     def __init__(self, config, bias: bool = False):
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
@@ -1464,9 +1466,11 @@ class Qwen2_5OmniAttention(nn.Module):
         return attn_output, attn_weights
 
 
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class Qwen2MLP(nn.Module):
     def __init__(self, config, bias: bool = False):
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)

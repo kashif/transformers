@@ -25,7 +25,7 @@ from ...backbone_utils import load_backbone
 from ...modeling_outputs import ModelOutput
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, logging
-from ...utils.generic import merge_with_config_defaults
+from ...utils.generic import merge_with_config_defaults, no_inherit_decorator
 from ...utils.output_capturing import OutputRecorder, capture_outputs
 from ..d_fine.configuration_d_fine import DFineConfig
 from ..d_fine.modeling_d_fine import (
@@ -219,6 +219,7 @@ class Deimv2RMSNorm(LlamaRMSNorm):
     pass
 
 
+@no_inherit_decorator
 class Deimv2SwiGLUFFN(LlamaMLP):
     def __init__(self, config: Deimv2Config):
         nn.Module.__init__(self)

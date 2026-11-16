@@ -13,10 +13,13 @@
 # limitations under the License.
 """Testing suite for the PyTorch FalconH1 model."""
 
+import copy
 import textwrap
 import unittest
+from unittest.mock import patch
 
 import pytest
+from parameterized import parameterized
 
 from transformers import DynamicCache, FalconH1Config, is_torch_available
 from transformers.testing_utils import (
@@ -27,6 +30,7 @@ from transformers.testing_utils import (
     slow,
     torch_device,
 )
+from transformers.utils import is_kernels_available
 
 from ...generation.test_utils import GenerationTesterMixin
 from ...test_configuration_common import ConfigTester
@@ -38,6 +42,11 @@ if is_torch_available():
     import torch
 
     from transformers import AutoTokenizer, FalconH1ForCausalLM, FalconH1Model
+    from transformers.models.falcon_h1.modeling_falcon_h1 import FalconH1MLP
+
+
+if is_kernels_available():
+    from kernels import LayerRepository, Mode, kernelize, use_kernel_mapping
 
 
 class FalconH1ModelTester:
@@ -362,6 +371,64 @@ class FalconH1ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterM
     def setUp(self):
         self.model_tester = FalconH1ModelTester(self)
         self.config_tester = ConfigTester(self, config_class=FalconH1Config, hidden_size=64)
+
+    @require_kernels
+    @parameterized.expand(["silu", "gelu"])
+    def test_mlp_kernel_preserves_multipliers(self, hidden_act):
+        class SwiGLU(torch.nn.Module):
+            can_torch_compile = True
+
+            def forward(self, x):
+                return self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
+
+        class ScaledSwiGLU(torch.nn.Module):
+            can_torch_compile = True
+
+            def forward(self, x):
+                gate = self.gate_proj(x) * self.gate_multiplier
+                return self.down_proj(torch.nn.functional.silu(gate) * self.up_proj(x)) * self.down_multiplier
+
+        config = self.model_tester.get_config()
+        config.hidden_act = hidden_act
+        # Published tiiuae/Falcon-H1-0.5B-Base scaling factors.
+        config.mlp_multipliers = [0.8838834764831844, 0.5859375]
+        torch.manual_seed(0)
+        reference = FalconH1MLP(config)
+        kernelized = copy.deepcopy(reference)
+        original_forward = kernelized.forward.__func__
+        x_ref = torch.randn(
+            self.model_tester.batch_size, self.model_tester.seq_length, config.hidden_size, requires_grad=True
+        )
+        x_kernel = x_ref.detach().clone().requires_grad_()
+        implementations = {"SwiGLUMLP": SwiGLU, "ScaledSwiGLUMLP": ScaledSwiGLU}
+        mapping = {
+            name: {
+                "cpu": {
+                    Mode.TRAINING: LayerRepository(
+                        repo_id="kernels-community/liger-kernels", layer_name=name, version=4
+                    )
+                }
+            }
+            for name in implementations
+        }
+        with (
+            patch.object(
+                LayerRepository, "load", autospec=True, side_effect=lambda repo: implementations[repo.layer_name]
+            ),
+            use_kernel_mapping(mapping, inherit_mapping=False),
+        ):
+            kernelize(kernelized, mode=Mode.TRAINING, device="cpu", use_fallback=True)
+        expected_forward = ScaledSwiGLU.forward if hidden_act == "silu" else original_forward
+        self.assertIs(kernelized.forward.__func__, expected_forward)
+
+        expected = reference(x_ref)
+        actual = kernelized(x_kernel)
+        expected.sum().backward()
+        actual.sum().backward()
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(x_kernel.grad, x_ref.grad)
+        for actual_parameter, expected_parameter in zip(kernelized.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual_parameter.grad, expected_parameter.grad)
 
     def test_config(self):
         self.config_tester.run_common_tests()

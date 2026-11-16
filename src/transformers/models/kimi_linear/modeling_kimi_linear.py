@@ -135,6 +135,7 @@ class KimiLinearExperts(nn.Module):
         return final_hidden_states
 
 
+@use_kernel_forward_from_hub("SwiGLUMLP", condition=lambda module: module.config.hidden_act == "silu")
 class KimiLinearMLP(nn.Module):
     def __init__(self, config, intermediate_size=None):
         super().__init__()
