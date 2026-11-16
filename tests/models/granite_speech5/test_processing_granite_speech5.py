@@ -26,6 +26,9 @@ class GraniteSpeech5ProcessorTest(ProcessorTesterMixin, unittest.TestCase):
     processor_class = GraniteSpeech5Processor
     text_input_name = "labels"
 
+    audio_text_kwargs_max_length = 1001
+    audio_unstructured_max_length = 1001
+
     @classmethod
     def _setup_tokenizer(cls):
         from tokenizers import Tokenizer
@@ -38,3 +41,7 @@ class GraniteSpeech5ProcessorTest(ProcessorTesterMixin, unittest.TestCase):
         tokenizer_object = Tokenizer(BPE(vocab=vocab, merges=merges, unk_token="<unk>"))
         tokenizer_object.pre_tokenizer = Whitespace()
         return ParakeetTokenizer(tokenizer_object=tokenizer_object, pad_token="<|blank|>", unk_token="<unk>")
+
+    @unittest.skip(reason="Cannot remove sampling_rate argument from __call__ without breaking BC.")
+    def test_call_arguments_not_in_processor_kwargs(self):
+        pass

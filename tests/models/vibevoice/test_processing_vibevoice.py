@@ -12,35 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import tempfile
 import unittest
 
 from parameterized import parameterized
 
 from transformers import VibeVoiceProcessor
 from transformers.testing_utils import require_librosa, require_torch
-from transformers.utils import is_torch_available
 
 from ...test_processing_common import MODALITY_INPUT_DATA, ProcessorTesterMixin
-
-
-if is_torch_available():
-    pass
 
 
 @require_torch
 class VibeVoiceProcessorTest(ProcessorTesterMixin, unittest.TestCase):
     processor_class = VibeVoiceProcessor
     audio_input_name = "input_values"
+    model_id = "vibevoice/VibeVoice-1.5B-hf"
 
     @classmethod
-    def setUpClass(cls):
-        cls.checkpoint = "vibevoice/VibeVoice-1.5B-hf"
-        processor = VibeVoiceProcessor.from_pretrained(cls.checkpoint)
-        cls.tmpdirname = tempfile.mkdtemp()
-        processor.save_pretrained(cls.tmpdirname)
-
-    def prepare_processor_dict(self):
+    def prepare_processor_dict(cls):
         return {
             "chat_template": """{%- set system_prompt = system_prompt | default(" Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n") -%}
 {{ system_prompt -}}

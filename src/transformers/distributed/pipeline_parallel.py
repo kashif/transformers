@@ -95,7 +95,8 @@ class PipelineStage:
 
         # Shared P2P: one isend/irecv with the adjacent rank.
         is_send = operation.startswith("send")
-        peer_rank = dest if is_send else src
+        peer_group_rank = dest if is_send else src
+        peer_rank = dist.get_global_rank(self.pp_group, peer_group_rank)
         op = dist.P2POp(dist.isend if is_send else dist.irecv, tensor, peer_rank, group=self.pp_group)
         # Wait for the communication to complete.
         for req in dist.batch_isend_irecv([op]):
@@ -155,7 +156,7 @@ class PipelineStage:
         if self.pp_size <= 1:
             return tensor
 
-        last_rank = self.pp_size - 1
+        last_rank = dist.get_global_rank(self.pp_group, self.pp_size - 1)
         comm_device = torch.device("cpu") if self.comm_on_cpu else device
         # Logits are always (batch, seq_len, vocab_size).
         logits_ndim = 3
@@ -264,7 +265,7 @@ def pipeline_parallel_naive_forward(
     if stage.pp_is_last_stage:
         # Last stage: compute the logits.
         outputs = original_forward(**fwd_kwargs)
-        logits, past_key_values = outputs.logits, outputs.past_key_values
+        logits, cache = outputs.logits, outputs.cache
     else:
         # Non-last stages: Compute and send the activations to the next stage.
         # We need the base models because hidden_states is getting slices in the causal_lm models + we want last_hidden_state
@@ -272,11 +273,11 @@ def pipeline_parallel_naive_forward(
         base_kwargs = {k: v for k, v in fwd_kwargs.items() if k not in {"labels", "logits_to_keep"}}
         base_outputs = base_model(**base_kwargs)
         stage.communicate("send_forward", device=device, dtype=dtype, tensor=base_outputs.last_hidden_state)
-        logits, past_key_values = None, base_outputs.past_key_values
+        logits, cache = None, base_outputs.cache
 
     # Only the last stage computed the logits, so broadcast them to every rank (they will be waiting)
     # TODO(3outeille): very naive implementation to make it work seamless with generate().
     # In long term, we want only the last stage to hold the logits not every stages that will require changes in generate() directly
     logits = stage.broadcast_from_last(logits, dtype=dtype, device=device)
 
-    return CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values)
+    return CausalLMOutputWithPast(logits=logits, cache=cache)

@@ -199,7 +199,7 @@ class FalconMambaModelTester:
         outputs = model(
             input_ids[:, -1:],
             use_cache=True,
-            cache_params=outputs.cache_params,
+            cache=outputs.cache,
         )
         output_two = outputs.last_hidden_state
 
@@ -216,10 +216,10 @@ class FalconMambaModelTester:
         input_ids = input_ids.to("cpu")
 
         if gradient_checkpointing:
-            model.gradient_checkpointing_enable()
+            model.activation_checkpointing_enable()
 
         # create cache
-        cache = model(input_ids, use_cache=True).cache_params
+        cache = model(input_ids, use_cache=True).cache
         cache.reset()
 
         # use cache
@@ -237,7 +237,7 @@ class FalconMambaModelTester:
         model = FalconMambaForCausalLM(config)
         model.to(torch_device)
         if gradient_checkpointing:
-            model.gradient_checkpointing_enable()
+            model.activation_checkpointing_enable()
 
         result = model(input_ids, labels=input_ids)
         self.parent.assertEqual(result.loss.shape, ())
@@ -391,10 +391,6 @@ class FalconMambaModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTest
             dict_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
             check_equivalence(model, tuple_inputs, dict_inputs, {"output_hidden_states": True})
 
-    @unittest.skip("Mamba models do not support DDP.")
-    def test_multi_gpu_data_parallel_forward(self):
-        pass
-
     @unittest.skip(
         "FalconMamba shares Mamba1's conv path, which has no chunked-continuation support: on a cached "
         "multi-token forward it rebuilds conv_state from the zero-padded current chunk instead of bridging "
@@ -436,6 +432,10 @@ class FalconMambaIntegrationTests(unittest.TestCase):
                     "cuda",
                     (8, 6),
                 ): "Hello today I am going to talk about the “Theory of Relativity” by Albert Einstein.\n",
+                (
+                    "xpu",
+                    5,
+                ): "Hello today I am going to talk about the “Theory of Relativity” by Albert Einstein.\n",
             }
         )
         EXPECTED_OUTPUT = EXPECTED_OUTPUTS.get_expectation()
@@ -459,6 +459,7 @@ class FalconMambaIntegrationTests(unittest.TestCase):
             {
                 ("cuda", (8, 0)): 'The mount Fuji is a nice mountain in Japan. It is a volcano. It is 3,776 meters high. It is the highest',
                 ("cuda", (8, 6)): 'The mount Fuji is a nice mountain in Japan. It is 3,776 meters high. It is a volcano. It is a very',
+                ("xpu", 5): 'The mount Fuji is a nice mountain in Japan. It is a volcano. It is 3,776 meters high. It is the highest',
             }
         )  # fmt: skip
         EXPECTED_OUTPUT = EXPECTED_OUTPUTS.get_expectation()
@@ -485,6 +486,10 @@ class FalconMambaIntegrationTests(unittest.TestCase):
                 (
                     "cuda",
                     (8, 6),
+                ): "Hello today I am going to talk about the “Theory of Relativity” by Albert Einstein.\n",
+                (
+                    "xpu",
+                    5,
                 ): "Hello today I am going to talk about the “Theory of Relativity” by Albert Einstein.\n",
             }
         )

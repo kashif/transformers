@@ -30,17 +30,18 @@ from ...image_utils import ImageInput, PILImageResampling, SizeDict
 from ...masking_utils import create_bidirectional_mask, create_bidirectional_sliding_window_mask
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, MaskedLMOutput
-from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import ImagesKwargs, Unpack
 from ...utils import (
     TensorType,
     TransformersKwargs,
     auto_docstring,
+    no_inherit_decorator,
     torch_compilable_check,
 )
 from ...utils.constants import IMAGENET_STANDARD_MEAN, IMAGENET_STANDARD_STD
-from ...utils.generic import can_return_tuple, maybe_autocast
+from ...utils.generic import can_return_tuple
 from ...utils.output_capturing import capture_outputs
 from ...utils.type_validators import positive_int
 from ..gemma4.modeling_gemma4 import Gemma4RMSNorm
@@ -282,25 +283,32 @@ class NeoMMEPatchEmbeddings(nn.Module):
 class NeoMMERotaryEmbedding(LagunaRotaryEmbedding):
     """Two-axis interleaved M-RoPE with per-layer-type frequency spectra."""
 
-    @torch.no_grad()
-    @dynamic_rope_update
     def forward(
         self, x: torch.Tensor, position_ids: torch.LongTensor, layer_type: str | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build cos/sin from two-axis `position_ids` of shape `(2, batch, seq_len)`."""
-        # Same axias 2D rope as in Qwen-VIT models, all will be standardized by @raushan
-        inv_freq = getattr(self, f"{layer_type}_inv_freq")  # (rotary_dim // 2,)
+        inv_freq = getattr(self, f"{layer_type}_inv_freq")
         attention_scaling = getattr(self, f"{layer_type}_attention_scaling")
 
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with maybe_autocast(device_type=device_type, enabled=False):
-            row_angles = position_ids[0].float().unsqueeze(-1) * inv_freq[0::2]
-            column_angles = position_ids[1].float().unsqueeze(-1) * inv_freq[1::2]
+        # One row of positions per M-RoPE axis: (num_axes, bs, positions)
+        position_ids = position_ids.expand(2, -1, -1)
+        # (2, batch, seq_len, rotary_dim // 2)
+        freqs = position_ids[..., None].float() * inv_freq.to(device=x.device, dtype=torch.float)
+        cos = freqs.cos() * attention_scaling
+        sin = freqs.sin() * attention_scaling
 
-            angles = torch.stack([row_angles, column_angles], dim=-1).flatten(-2)
-            cos = (angles.cos() * attention_scaling).to(x.dtype)
-            sin = (angles.sin() * attention_scaling).to(x.dtype)
-        return torch.cat([cos, cos], dim=-1), torch.cat([sin, sin], dim=-1)
+        cos = self.recomposition_frequencies(cos)
+        sin = self.recomposition_frequencies(sin)
+        return cos.to(x.dtype), sin.to(x.dtype)
+
+    def recomposition_frequencies(self, freq):
+        """
+        Recompose the frequencies into the final spatial layout used per each grid.
+        """
+        # in contrast to the H-H-W-W layout, row/col here interleave as row0-col0-row1-col1
+        # i.e. `mrope_section = [head_dim//4, head_dim//4]`
+        freq_row, freq_col = freq[0][..., 0::2], freq[1][..., 1::2]
+        angles = torch.stack([freq_row, freq_col], dim=-1).flatten(-2)
+        return torch.cat([angles, angles], dim=-1)
 
 
 class NeoMMEExclusiveSelfAttention(nn.Module):
@@ -328,6 +336,7 @@ class NeoMMESigmoidGatedProjection(nn.Module):
         return self.o_proj(attn_output * torch.sigmoid(self.gate_proj(hidden_states)))
 
 
+@no_inherit_decorator
 class NeoMMEAttention(MuseGlimmerTextAttention):
     """Bidirectional grouped-query attention with QK-norm, M-RoPE, and a sigmoid output gate.
 
@@ -632,6 +641,7 @@ class NeoMMEForMaskedLM(NeoMMEPreTrainedModel):
         "lm_head.weight": "model.embed_tokens.word_embeddings.weight",
         "unembedding_projection.weight": "model.embed_tokens.embedding_projection.weight",
     }
+    _tp_plan = {"lm_head": "colwise_gather_output"}
 
     def __init__(self, config: NeoMMEConfig):
         super().__init__(config)
@@ -687,18 +697,18 @@ class NeoMMEForMaskedLM(NeoMMEPreTrainedModel):
 @dataclass
 class NeoMMEForRetrievalOutput(BaseModelOutput):
     r"""
-    loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
+    loss (`torch.Tensor` of shape `(1,)`, *optional*):
         Retrieval loss. This value is always `None`.
-    embeddings (`torch.FloatTensor` of shape `(batch_size, sequence_length, embedding_dim)`, *optional*):
+    embeddings (`torch.Tensor` of shape `(batch_size, sequence_length, embedding_dim)`, *optional*):
         Normalized token embeddings for late-interaction retrieval. Padding rows are zeroed. Score them with MeanMaxSim.
-    dense_embeddings (`torch.FloatTensor` of shape `(batch_size, hidden_size)` or `(batch_size, dense_dim)`, *optional*):
+    dense_embeddings (`torch.Tensor` of shape `(batch_size, hidden_size)` or `(batch_size, dense_dim)`, *optional*):
         A normalized mean-pooled embedding for each input. When `dense_dim` is set, the last dimension is `dense_dim`.
         Score them with cosine similarity.
     """
 
-    loss: torch.FloatTensor | None = None
-    embeddings: torch.FloatTensor | None = None
-    dense_embeddings: torch.FloatTensor | None = None
+    loss: torch.Tensor | None = None
+    embeddings: torch.Tensor | None = None
+    dense_embeddings: torch.Tensor | None = None
 
 
 class NeoMMEMultiVectorHead(nn.Module):

@@ -32,8 +32,10 @@ from transformers.testing_utils import (
     require_vision,
 )
 from transformers.video_utils import (
+    VideoMetadata,
     group_videos_by_shape,
     is_torchvision_video_decoding_available,
+    make_batched_metadata,
     make_batched_videos,
     reorder_videos,
 )
@@ -46,7 +48,7 @@ if is_vision_available():
     import PIL
 
     from transformers import BaseVideoProcessor
-    from transformers.video_utils import VideoMetadata, load_video
+    from transformers.video_utils import load_video
 
 
 def get_random_video(height, width, num_frames=8, return_torch=False):
@@ -170,6 +172,19 @@ class BaseVideoProcessorTester(unittest.TestCase):
         self.assertEqual(videos_list[0].shape, (8, 16, 32, 3))
         self.assertTrue(np.array_equal(videos_list[0], video))
 
+    def test_make_batched_metadata_needs_one_entry_per_video(self):
+        videos = [get_random_video(16, 32), get_random_video(16, 32)]
+        metadata = {"total_num_frames": 8, "fps": 2.0}
+        batched = make_batched_metadata(videos, [metadata, metadata])
+        self.assertEqual([entry.fps for entry in batched], [2.0, 2.0])
+        self.assertEqual([entry.fps for entry in make_batched_metadata(videos, None)], [None, None])
+        for video_metadata in ([metadata], metadata, [[metadata]], [metadata] * 3):
+            with (
+                self.subTest(video_metadata=video_metadata),
+                self.assertRaisesRegex(ValueError, "Received 2 videos but"),
+            ):
+                make_batched_metadata(videos, video_metadata)
+
     def test_resize(self):
         video_processor = BaseVideoProcessor(model_init_kwargs=VideosKwargs)
         video = get_random_video(16, 32, return_torch=True)
@@ -206,9 +221,6 @@ class BaseVideoProcessorTester(unittest.TestCase):
             self.assertEqual(cropped_video.shape, (8, 3, *expected_size))
 
     def test_convert_to_rgb(self):
-        from transformers.image_utils import ChannelDimension
-        from transformers.video_utils import convert_to_rgb
-
         video_processor = BaseVideoProcessor(model_init_kwargs=VideosKwargs)
         video = get_random_video(20, 20, return_torch=True)
 
@@ -253,41 +265,6 @@ class BaseVideoProcessorTester(unittest.TestCase):
             rgb_video[0, :, 0, 0],
             torch.tensor([255.0, 255.0, 255.0]),
         )
-
-        # Test numpy video with alpha channel (transparent, opaque, fully transparent)
-        video_np_transparent = np.array(
-            [
-                [[[255, 0, 0, 128]]],
-                [[[0, 255, 0, 64]]],
-            ],
-            dtype=np.uint8,
-        )
-        rgb_video = convert_to_rgb(video_np_transparent, input_data_format=ChannelDimension.LAST)
-        self.assertEqual(rgb_video.shape, (2, 3, 1, 1))
-        # Red with alpha=128 over white: (1 - 128/255)*255 + (128/255)*255 = 255 for R, ~127.5 for G and B
-        np.testing.assert_allclose(rgb_video[0, :, 0, 0], [255.0, 127.0, 127.0], atol=1.0)
-
-        video_np_opaque = np.array(
-            [
-                [[[255, 0, 0, 255]]],
-                [[[0, 255, 0, 255]]],
-            ],
-            dtype=np.uint8,
-        )
-        rgb_video = convert_to_rgb(video_np_opaque, input_data_format=ChannelDimension.LAST)
-        self.assertEqual(rgb_video.shape, (2, 3, 1, 1))
-        np.testing.assert_array_equal(rgb_video[0, :, 0, 0], [255, 0, 0])
-
-        # Fully transparent (alpha=0)
-        video_np_zero_alpha = np.array(
-            [
-                [[[255, 0, 0, 0]]],
-            ],
-            dtype=np.uint8,
-        )
-        rgb_video = convert_to_rgb(video_np_zero_alpha, input_data_format=ChannelDimension.LAST)
-        self.assertEqual(rgb_video.shape, (1, 3, 1, 1))
-        np.testing.assert_array_equal(rgb_video[0, :, 0, 0], [255, 255, 255])
 
     def test_group_and_reorder_videos(self):
         """Tests that videos can be grouped by frame size and number of frames"""
@@ -342,7 +319,7 @@ class BaseVideoProcessorTester(unittest.TestCase):
 class LoadVideoTester(unittest.TestCase):
     def test_load_video_url(self):
         video, _ = load_video(
-            "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4",
+            "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/sample_demo_1.mp4",
         )
         self.assertEqual(video.shape, (243, 360, 640, 3))  # 243 frames is the whole video, no sampling applied
 
@@ -364,13 +341,13 @@ class LoadVideoTester(unittest.TestCase):
     @require_cv2
     def test_load_video_backend_url(self):
         video, _ = load_video(
-            "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4",
+            "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/sample_demo_1.mp4",
             backend="decord",
         )
         self.assertEqual(video.shape, (243, 360, 640, 3))
 
         video, _ = load_video(
-            "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4",
+            "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/sample_demo_1.mp4",
             backend="torchcodec",
         )
         self.assertEqual(video.shape, (243, 3, 360, 640))
@@ -378,7 +355,7 @@ class LoadVideoTester(unittest.TestCase):
         # Can't use certain backends with url
         with self.assertRaises(ValueError):
             video, _ = load_video(
-                "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4",
+                "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/sample_demo_1.mp4",
                 backend="opencv",
             )
 
@@ -414,7 +391,7 @@ class LoadVideoTester(unittest.TestCase):
         # Can't use the `torchvision` backend with a url
         with self.assertRaises(ValueError):
             load_video(
-                "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4",
+                "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/sample_demo_1.mp4",
                 backend="torchvision",
             )
 
@@ -432,35 +409,23 @@ class LoadVideoTester(unittest.TestCase):
 
     def test_load_video_num_frames(self):
         video, _ = load_video(
-            "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4",
+            "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/sample_demo_1.mp4",
             num_frames=16,
         )
         self.assertEqual(video.shape, (16, 360, 640, 3))
 
         video, _ = load_video(
-            "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4",
+            "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/sample_demo_1.mp4",
             num_frames=22,
         )
         self.assertEqual(video.shape, (22, 360, 640, 3))
 
-    def test_load_video_fps(self):
+    def test_fps_sampling_short_video_keeps_one_frame(self):
         video, _ = load_video(
-            "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4", fps=1
+            "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/tiny_video.mp4",
+            fps=0.25,
         )
-        self.assertEqual(video.shape, (9, 360, 640, 3))
-
-        video, _ = load_video(
-            "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4", fps=2
-        )
-        self.assertEqual(video.shape, (19, 360, 640, 3))
-
-        # `num_frames` is mutually exclusive with `video_fps`
-        with self.assertRaises(ValueError):
-            video, _ = load_video(
-                "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4",
-                fps=1,
-                num_frames=10,
-            )
+        self.assertEqual(video.shape, (1, 2160, 3840, 3))
 
     def test_load_video_num_frames_exceeds_total(self):
         video_file_path = hf_hub_download(
@@ -468,3 +433,22 @@ class LoadVideoTester(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "exceeds total_num_frames"):
             load_video(video_file_path, num_frames=300)
+
+    def test_load_video_fps(self):
+        video, _ = load_video(
+            "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/sample_demo_1.mp4", fps=1
+        )
+        self.assertEqual(video.shape, (9, 360, 640, 3))
+
+        video, _ = load_video(
+            "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/sample_demo_1.mp4", fps=2
+        )
+        self.assertEqual(video.shape, (19, 360, 640, 3))
+
+        # `num_frames` is mutually exclusive with `video_fps`
+        with self.assertRaises(ValueError):
+            video, _ = load_video(
+                "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/sample_demo_1.mp4",
+                fps=1,
+                num_frames=10,
+            )

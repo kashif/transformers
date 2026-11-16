@@ -27,12 +27,17 @@ from ...masking_utils import (
 )
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_layers import GenericForSequenceClassification
-from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
-from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, RopeParameters, dynamic_rope_update
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
-from ...processing_utils import Unpack
+from ...modeling_outputs import (
+    BaseModelOutputWithPast,
+    BaseModelOutputWithPooling,
+    CausalLMOutputWithPast,
+    SequenceClassifierOutputWithPast,
+)
+from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, RopeParameters
+from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel, slice_logits_to_keep
+from ...processing_utils import ProcessingKwargs, Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
-from ...utils.generic import maybe_autocast
+from ...utils.deprecation import deprecate_attr, deprecate_kwarg
 from ..cohere2.configuration_cohere2 import Cohere2Config
 from ..cohere2.modeling_cohere2 import (
     Cohere2Attention,
@@ -77,7 +82,7 @@ class CohereCompassTextConfig(Cohere2Config):
 
     model_type = "cohere_compass_text"
     base_config_key = "text_config"
-    keys_to_ignore_at_inference = ["past_key_values"]
+    keys_to_ignore_at_inference = ["cache"]
     ignore_keys_at_rope_validation = {"mrope_section", "mrope_interleaved"}
 
     rope_parameters: dict[str, RopeParameters | dict | float | str | int | None] | None = None
@@ -93,6 +98,11 @@ class CohereCompassTextConfig(Cohere2Config):
     def convert_rope_params_to_dict(self, **kwargs):
         # allow per layer rope with optional NoPE layers
         self.rope_parameters = self.rope_parameters if self.rope_parameters is not None else {}
+        # workaround until the hub config is fixed, dangling entries were saved that fire on validation
+        # ref: https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct/discussions/3
+        if self.layer_types is not None and not set(self.rope_parameters.keys()).isdisjoint(self.layer_types):
+            self.rope_parameters.pop("rope_theta", None)
+            self.rope_parameters.pop("rope_type", None)
         self.standardize_rope_params()
         return kwargs
 
@@ -117,11 +127,6 @@ class CohereCompassConfig(Qwen3VLConfig):
     ```"""
 
     model_type = "cohere_compass"
-    sub_configs = {
-        "text_config": CohereCompassTextConfig,
-        "vision_config": CohereCompassVisionConfig,
-    }
-
     image_token_id: int = 255031
     video_token_id: int = 255032
     vision_start_token_id: int = 255028
@@ -160,49 +165,82 @@ class CohereCompassProcessor(Qwen3VLProcessor):
         self.vision_end_token = "<|VISION_END|>"
 
 
+# Same mrope interleaving pattern as Qwen3VL but this model has layer-types
 class CohereCompassRotaryEmbedding(Gemma3RotaryEmbedding):
-    """Gemma3 rotary embedding adapted to Compass's multi-axis position IDs."""
+    def __init__(self, config: CohereCompassTextConfig, device=None):
+        nn.Module.__init__()
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+        self.config = config
+        self.layer_types = list(set(config.layer_types))
+        self.rope_type = {}
+        self.mrope_section = {}
+        for layer_type in self.layer_types:
+            rope_params = self.config.rope_parameters[layer_type]
+            if rope_params is None:
+                continue
 
-    # Copied from: Qwen3VLTextRotaryEmbedding.apply_interleaved_mrope, added supported for layer_types
-    @torch.no_grad()
-    @dynamic_rope_update
+            self.rope_type[layer_type] = rope_params["rope_type"]
+            self.mrope_section[layer_type] = rope_params.get("mrope_section", [24, 20, 20])
+            rope_init_fn: Callable = self.compute_default_rope_parameters
+            if self.rope_type[layer_type] != "default":
+                rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type[layer_type]]
+            curr_inv_freq, curr_attention_scaling = rope_init_fn(self.config, device, layer_type=layer_type)
+            setattr(self, f"{layer_type}_inv_freq", nn.Buffer(curr_inv_freq, persistent=False))
+            setattr(self, f"{layer_type}_original_inv_freq", nn.Buffer(curr_inv_freq.clone(), persistent=False))
+            setattr(self, f"{layer_type}_attention_scaling", curr_attention_scaling)
+
+    def compute_default_rope_parameters(
+        config: CohereCompassTextConfig, device=None, layer_type: str | None = None, **kwargs
+    ) -> tuple[torch.Tensor, float]:
+        """
+        Computes the inverse frequencies according to the original RoPE implementation
+        Args:
+            config ([`~transformers.PreTrainedConfig`]):
+                The model configuration.
+            layer_type (`str`):
+                The current layer type if the model has different RoPE parameters per type.
+                Should not be used unless `config.layer_types is not None`
+
+        Returns:
+            Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+            post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
+        """
+        base = config.rope_parameters[layer_type]["rope_theta"]
+        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+
+        attention_factor = 1.0  # Unused in this type of RoPE
+
+        # Compute the inverse frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        return inv_freq.to(device), attention_factor
+
     def forward(self, x, position_ids, layer_type=None):
         inv_freq = getattr(self, f"{layer_type}_inv_freq")
         attention_scaling = getattr(self, f"{layer_type}_attention_scaling")
 
-        # In contrast to other models, Cohere has different position ids for the grids
-        # So we expand the inv_freq to shape (3, ...)
-        inv_freq_expanded = inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1).to(x.device)
-        position_ids_expanded = position_ids[:, :, None, :].float()  # shape (3, bs, 1, positions)
+        # One row of positions per M-RoPE axis: (num_axes, bs, positions)
+        position_ids = position_ids.expand(3, -1, -1)
+        freqs = position_ids[..., None].float() * inv_freq.to(device=x.device, dtype=torch.float)
+        cos = freqs.cos() * attention_scaling
+        sin = freqs.sin() * attention_scaling
 
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with maybe_autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
-            mrope_section = self.config.rope_parameters[layer_type].get("mrope_section", [24, 20, 20])
-            freqs = self.apply_interleaved_mrope(freqs, mrope_section)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos() * attention_scaling
-            sin = emb.sin() * attention_scaling
+        sin = self.recomposition_frequencies(sin, layer_type)
+        cos = self.recomposition_frequencies(cos, layer_type)
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
-    # Copied from: Qwen3VLTextRotaryEmbedding.apply_interleaved_mrope
-    def apply_interleaved_mrope(self, freqs, mrope_section):
-        """Apply interleaved MRoPE to 3D rotary embeddings.
-        Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
-        interleaved [THWTHWTHW...TT], preserving frequency continuity.
-        args:
-            x: (3, bs, seq_len, head_dim // 2)
-            mrope_section: (3,)
-        returns:
-            x_t: (bs, seq_len, head_dim // 2)
+    def recomposition_frequencies(self, freq, layer_type):
         """
-        freqs_t = freqs[0]  # just overwrite the first dimension T
+        Recompose the frequencies into the final spatial layout used per each grid.
+        """
+        mrope_section = self.mrope_section[layer_type]
+        freqs_thw = freq[0]  # just overwrite the first dimension T
         for dim, offset in enumerate((1, 2), start=1):  # H, W
             length = mrope_section[dim] * 3
             idx = slice(offset, length, 3)
-            freqs_t[..., idx] = freqs[dim, ..., idx]
-        return freqs_t
+            freqs_thw[..., idx] = freq[dim, ..., idx]
+        return torch.cat((freqs_thw, freqs_thw), dim=-1)
 
 
 class CohereCompassMLP(Cohere2MLP):
@@ -217,12 +255,13 @@ class CohereCompassAttention(Cohere2Attention):
     def __init__(self, config: CohereCompassTextConfig, layer_idx: int):
         super().__init__(config, layer_idx)
 
+    @deprecate_kwarg("past_key_values", "5.40.0", new_name="cache")
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
         attention_mask: torch.Tensor | None,
-        past_key_values: Cache | None = None,
+        cache: Cache | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -236,8 +275,8 @@ class CohereCompassAttention(Cohere2Attention):
             cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_values is not None:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+        if cache is not None:
+            key_states, value_states = cache.update(key_states, value_states, self.layer_idx, kwargs=kwargs)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -267,9 +306,10 @@ class CohereCompassDecoderLayer(Cohere2DecoderLayer):
 
 @auto_docstring
 class CohereCompassPreTrainedModel(Qwen3VLPreTrainedModel):
-    input_modalities = ("image", "text")
+    input_modalities = ("image", "video", "text")
     _no_split_modules = [
         "CohereCompassDecoderLayer",
+        "CohereCompassVisionBlock",
     ]
     _can_record_outputs = {
         "hidden_states": CohereCompassDecoderLayer,
@@ -278,7 +318,7 @@ class CohereCompassPreTrainedModel(Qwen3VLPreTrainedModel):
 
     @torch.no_grad()
     def _init_weights(self, module):
-        super()._init_weights(module)
+        PreTrainedModel._init_weights(self, module)
         if isinstance(module, CohereCompassRotaryEmbedding):
             for layer_type in module.rope_type:
                 rope_init_fn = module.compute_default_rope_parameters
@@ -304,13 +344,14 @@ class CohereCompassTextModel(Qwen3VLTextModel, CohereCompassPreTrainedModel):
 
         self.rotary_emb = CohereCompassRotaryEmbedding(config)
 
+    @deprecate_kwarg("past_key_values", "5.40.0", new_name="cache")
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
+        cache: Cache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
         visual_pos_masks: torch.Tensor | None = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
@@ -330,12 +371,12 @@ class CohereCompassTextModel(Qwen3VLTextModel, CohereCompassPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if use_cache and past_key_values is None and not self.training and not torch.jit.is_tracing():
-            past_key_values = DynamicCache(config=self.config)
+        if use_cache and cache is None and not self.training and not torch.jit.is_tracing():
+            cache = DynamicCache(config=self.config)
 
         # the hard coded `4` is for text, temporal, height and width.
         if position_ids is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            past_seen_tokens = cache.get_seq_length() if cache is not None else 0
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
         elif position_ids.ndim == 2:
@@ -352,7 +393,7 @@ class CohereCompassTextModel(Qwen3VLTextModel, CohereCompassPreTrainedModel):
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
-                "past_key_values": past_key_values,
+                "cache": cache,
                 "position_ids": text_position_ids,
             }
             causal_mask_mapping = {
@@ -375,7 +416,7 @@ class CohereCompassTextModel(Qwen3VLTextModel, CohereCompassPreTrainedModel):
                 hidden_states,
                 position_embeddings=position_embeddings[self.config.layer_types[layer_idx]],
                 attention_mask=causal_mask_mapping[self.config.layer_types[layer_idx]],
-                past_key_values=past_key_values,
+                cache=cache,
                 use_cache=use_cache,
                 **kwargs,
             )
@@ -385,7 +426,7 @@ class CohereCompassTextModel(Qwen3VLTextModel, CohereCompassPreTrainedModel):
                 )
 
         hidden_states = self.norm(hidden_states)
-        return BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=past_key_values)
+        return BaseModelOutputWithPast(last_hidden_state=hidden_states, cache=cache)
 
 
 @auto_docstring
@@ -425,21 +466,23 @@ class CohereCompassForConditionalGeneration(Qwen3VLForConditionalGeneration, Coh
 
     @can_return_tuple
     @auto_docstring(checkpoint="CohereLabs/North-Micro-Vision-Instruct")
+    @deprecate_kwarg("past_key_values", "5.40.0", new_name="cache")
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
+        cache: Cache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         labels: torch.LongTensor | None = None,
         pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.FloatTensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        mm_encoder_outputs: dict[str, BaseModelOutputWithPooling] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
@@ -498,14 +541,15 @@ class CohereCompassForConditionalGeneration(Qwen3VLForConditionalGeneration, Coh
             mm_token_type_ids=mm_token_type_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
+            cache=cache,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            mm_encoder_outputs=mm_encoder_outputs,
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        hidden_states = slice_logits_to_keep(hidden_states, logits_to_keep)
+        logits = self.lm_head(hidden_states)
         if self.logit_scale is not None:
             logits = logits * self.logit_scale
 
@@ -518,7 +562,7 @@ class CohereCompassForConditionalGeneration(Qwen3VLForConditionalGeneration, Coh
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=outputs.past_key_values,
+            cache=outputs.cache,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
@@ -558,13 +602,14 @@ class CohereCompassTextForSequenceClassification(GenericForSequenceClassificatio
     # Overwritten: We want to support multiple pooling strategies
     @can_return_tuple
     @auto_docstring
+    @deprecate_kwarg("past_key_values", "5.40.0", new_name="cache")
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
+        cache: Cache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -574,7 +619,7 @@ class CohereCompassTextForSequenceClassification(GenericForSequenceClassificatio
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=past_key_values,
+                cache=cache,
                 inputs_embeds=inputs_embeds,
                 labels=labels,
                 use_cache=use_cache,
@@ -585,7 +630,7 @@ class CohereCompassTextForSequenceClassification(GenericForSequenceClassificatio
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            cache=cache,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             **kwargs,
@@ -610,11 +655,13 @@ class CohereCompassTextForSequenceClassification(GenericForSequenceClassificatio
         return SequenceClassifierOutputWithPast(
             loss=loss,
             logits=pooled_logits,
-            past_key_values=outputs.past_key_values,
+            cache=outputs.cache,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
 
+
+__getattr__ = deprecate_attr(__name__, rename={"CohereCompassProcessorKwargs": (ProcessingKwargs, "5.29.0")})
 
 __all__ = [
     "CohereCompassConfig",

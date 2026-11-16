@@ -30,7 +30,7 @@ from transformers.testing_utils import (
     CaptureLogger,
     Expectations,
     is_pipeline_test,
-    require_librosa,
+    require_audio,
     require_torch,
     require_vision,
     slow,
@@ -52,10 +52,43 @@ if is_torch_available():
 
 @is_pipeline_test
 @require_vision
-@require_librosa
+@require_audio
 @require_torch
 class AnyToAnyPipelineTests(unittest.TestCase):
     model_mapping = MODEL_FOR_MULTIMODAL_LM_MAPPING
+
+    def test_multiple_candidates_tiny_model(self):
+        pipe = pipeline(
+            "any-to-any",
+            model="hf-internal-testing/tiny-random-Qwen2_5OmniForConditionalGeneration",
+        )
+        kwargs = {
+            "generation_mode": "text",
+            "thinker_do_sample": False,
+            "thinker_num_beams": 2,
+            "thinker_num_return_sequences": 2,
+            "thinker_max_new_tokens": 2,
+        }
+
+        single = pipe(text="Hello", return_full_text=False, generate_kwargs=kwargs)
+        batched = pipe(text=["Hello", "World"], return_full_text=False, generate_kwargs=kwargs)
+
+        self.assertEqual(len(single), 2)
+        self.assertEqual(len(batched), 4)
+
+        # Test real audio generation through the full pipeline.
+        audio_outputs = pipe(
+            text="Hello",
+            generation_mode="audio",
+            generate_kwargs={
+                "thinker_do_sample": False,
+                "thinker_max_new_tokens": 4,
+                "talker_do_sample": False,
+                "talker_max_new_tokens": 10,
+            },
+        )
+        self.assertEqual(len(audio_outputs), 1)
+        self.assertIsInstance(audio_outputs[0]["generated_audio"], np.ndarray)
 
     # We only need `processor` but the Mixin will pass all possible preprocessing classes for a model.
     # So we add them all in signature
@@ -84,13 +117,13 @@ class AnyToAnyPipelineTests(unittest.TestCase):
         videos_examples = [
             {
                 "videos": url_to_local_path(
-                    "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/Big_Buck_Bunny_720_10s_10MB.mp4"
+                    "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/Big_Buck_Bunny_720_10s_10MB.mp4"
                 ),
                 "text": f"{video_token}This video shows a ",
             },
             {
                 "videos": url_to_local_path(
-                    "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4"
+                    "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/sample_demo_1.mp4"
                 ),
                 "text": f"{video_token}In the video I see a ",
             },
@@ -99,13 +132,13 @@ class AnyToAnyPipelineTests(unittest.TestCase):
         audio_examples = [
             {
                 "audio": url_to_local_path(
-                    "https://huggingface.co/datasets/raushan-testing-hf/audio-test/resolve/main/glass-breaking-151256.mp3"
+                    "https://huggingface.co/datasets/hf-internal-testing/dummy-audio-samples/resolve/main/glass-breaking-151256.mp3"
                 ),
                 "text": f"{audio_token}This is sound of a ",
             },
             {
                 "audio": url_to_local_path(
-                    "https://huggingface.co/datasets/raushan-testing-hf/audio-test/resolve/main/f2641_0_throatclearing.wav"
+                    "https://huggingface.co/datasets/hf-internal-testing/dummy-audio-samples/resolve/main/f2641_0_throatclearing.wav"
                 ),
                 "text": f"{audio_token}Here I hear a ",
             },
@@ -390,7 +423,7 @@ class AnyToAnyPipelineTests(unittest.TestCase):
             "defaults": {"role": "assistant"},
             "start_anchor": "<start_of_turn>model\n",
             "fields": {
-                "thinking": {"open": "<think>", "close": "</think>", "content": "text"},
+                "reasoning_content": {"open": "<think>", "close": "</think>", "content": "text"},
                 "content": {"close": "<end_of_turn>", "content": "text"},
             },
         }
@@ -405,21 +438,21 @@ class AnyToAnyPipelineTests(unittest.TestCase):
         outputs = pipe(text=messages, generate_kwargs={"do_sample": False})
         parsed_message = outputs[0]["generated_text"][-1]
         # The model never emits </think> here, so everything it generates stays inside the
-        # `thinking` region opened by the chat template in the prompt. Without `prefix=`,
+        # `reasoning_content` region opened by the chat template in the prompt. Without `prefix=`,
         # the parser would never see the opening <think> and would mis-route the generated
         # text into `content` instead.
         self.assertEqual(parsed_message["role"], "assistant")
-        self.assertIn("thinking", parsed_message)
+        self.assertIn("reasoning_content", parsed_message)
         self.assertNotIn("content", parsed_message)
-        self.assertIsInstance(parsed_message["thinking"], str)
-        self.assertGreater(len(parsed_message["thinking"]), 0)
+        self.assertIsInstance(parsed_message["reasoning_content"], str)
+        self.assertGreater(len(parsed_message["reasoning_content"]), 0)
 
     @slow
     def test_small_model_pt_token_audio_input(self):
         pipe = pipeline("any-to-any", model="google/gemma-3n-E4B-it")
 
         audio_path = url_to_local_path(
-            "https://huggingface.co/datasets/raushan-testing-hf/audio-test/resolve/main/f2641_0_throatclearing.wav"
+            "https://huggingface.co/datasets/hf-internal-testing/dummy-audio-samples/resolve/main/f2641_0_throatclearing.wav"
         )
         messages = [
             {
@@ -442,7 +475,7 @@ class AnyToAnyPipelineTests(unittest.TestCase):
                                 {"type": "text", "text": "What do you hear in this audio?"},
                                 {
                                     "type": "audio",
-                                    "url": "https://huggingface.co/datasets/raushan-testing-hf/audio-test/resolve/main/f2641_0_throatclearing.wav",
+                                    "url": "https://huggingface.co/datasets/hf-internal-testing/dummy-audio-samples/resolve/main/f2641_0_throatclearing.wav",
                                 },
                             ],
                         }
@@ -457,7 +490,7 @@ class AnyToAnyPipelineTests(unittest.TestCase):
         pipe = pipeline("any-to-any", model="Qwen/Qwen2.5-Omni-3B", dtype="bfloat16")
 
         video_path = url_to_local_path(
-            "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/Cooking_cake.mp4"
+            "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/Cooking_cake.mp4"
         )
         messages = [
             {
@@ -498,7 +531,7 @@ class AnyToAnyPipelineTests(unittest.TestCase):
                                 {"type": "text", "text": "Describe this video."},
                                 {
                                     "type": "video",
-                                    "video": "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/Cooking_cake.mp4",
+                                    "video": "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/Cooking_cake.mp4",
                                 },
                             ],
                         }
@@ -510,7 +543,7 @@ class AnyToAnyPipelineTests(unittest.TestCase):
                                 {"type": "text", "text": "Describe this video."},
                                 {
                                     "type": "video",
-                                    "video": "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/Cooking_cake.mp4",
+                                    "video": "https://huggingface.co/datasets/hf-internal-testing/fixtures_videos/resolve/main/Cooking_cake.mp4",
                                 },
                             ],
                         },

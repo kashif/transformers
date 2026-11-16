@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 from transformers.utils import logging
 from transformers.utils.chat_parsing import ResponseParser
+from transformers.utils.chat_template_utils import _REASONING_FIELDS
 
 
 if TYPE_CHECKING:
@@ -54,6 +55,19 @@ logger = logging.get_logger(__name__)
 
 
 X_REQUEST_ID = "x-request-id"
+
+
+def split_model_id(model_id: str) -> tuple[str, str | None]:
+    """`<repo>[@revision][:<file>.gguf]` -> the id without the file, and the file if one was named.
+
+    `<repo>:<file>.gguf` is how GGUF clients name a file inside a repository: the repository says which
+    model, the file which weights, and both are answered for rather than one of them dropped. A colon
+    that is not a `.gguf` file is left alone -- it is part of the id.
+    """
+    head, _, named = model_id.partition(":")
+    if named and not named.endswith(".gguf"):
+        return model_id, None
+    return head, named or None
 
 
 class Modality(enum.Enum):
@@ -107,7 +121,7 @@ _RESPONSE_TEMPLATE_FALLBACKS = {
         "defaults": {"role": "assistant"},
         "start_anchor": "<|im_start|>assistant\n",
         "fields": {
-            "thinking": {
+            "reasoning_content": {
                 "open": "<think>",
                 "close": "</think>",
                 "content": "text",
@@ -135,11 +149,11 @@ _RESPONSE_TEMPLATE_FALLBACKS = {
     # <function=NAME><parameter=KEY>VALUE</parameter></function> markup that holds the call data.
     # The chat template prefills the assistant turn with either "<think>\n" (thinking on) or
     # "<think>\n\n</think>\n\n" (default), which prefix-aware parsing picks up via start_anchor.
-    ("qwen3_5", "qwen3_5_moe"): {
+    ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"): {
         "defaults": {"role": "assistant"},
         "start_anchor": "<|im_start|>assistant\n",
         "fields": {
-            "thinking": {
+            "reasoning_content": {
                 "open": "<think>",
                 "close": "</think>",
                 "content": "text",
@@ -169,7 +183,7 @@ _RESPONSE_TEMPLATE_FALLBACKS = {
         "defaults": {"role": "assistant"},
         "start_anchor": ["<|turn>model\n", "<tool_response|>"],
         "fields": {
-            "thinking": {
+            "reasoning_content": {
                 "open": "<|channel>thought\n",
                 "close": "<channel|>",
                 "content": "text",
@@ -223,6 +237,7 @@ def build_response_parser(
     processor,
     model: "PreTrainedModel",
     input_ids,
+    tools=None,
 ) -> "ResponseParser | None":
     """Build a streaming :class:`ResponseParser` for the current generation.
 
@@ -239,7 +254,7 @@ def build_response_parser(
     if template is None:
         return None
     tokenizer = getattr(processor, "tokenizer", processor)
-    return ResponseParser(template, prefix=_decode_prefix(tokenizer, input_ids))
+    return ResponseParser(template, prefix=_decode_prefix(tokenizer, input_ids), tools=tools)
 
 
 def _normalize_tool_call(value: dict) -> ToolCall:
@@ -279,6 +294,7 @@ def parse_assistant_message(
     generated_ids,
     input_ids,
     cleaned_content: str = "",
+    tools=None,
 ) -> tuple[str, str | None, list[ToolCall] | None]:
     """Parse a full assistant message into ``(content, reasoning, tool_calls)``.
 
@@ -294,11 +310,14 @@ def parse_assistant_message(
     if template is None:
         return cleaned_content, None, None
     tokenizer = getattr(processor, "tokenizer", processor)
-    parsed = tokenizer.parse_response(generated_ids, template, prefix=_decode_prefix(tokenizer, input_ids))
+    parsed = tokenizer.parse_response(
+        generated_ids, template, prefix=_decode_prefix(tokenizer, input_ids), tools=tools
+    )
     # Absent ``content`` key means the model emitted only tool calls / thinking;
     # surface that as an empty string rather than swapping in the raw decode.
     content = parsed.get("content", "")
-    reasoning = parsed.get("thinking")
+    # Response templates should name the field `reasoning_content`, but some on the Hub still use `thinking`
+    reasoning = next((parsed[field] for field in _REASONING_FIELDS if parsed.get(field) is not None), None)
     raw = parsed.get("tool_calls") or []
     tool_calls = [_normalize_tool_call(v) for v in raw] or None
     return content, reasoning, tool_calls
@@ -328,7 +347,7 @@ def response_events_to_chunks(events: list[dict]) -> list:
             text = ev.get("text") or ""
             if not text:
                 continue
-            if field == "thinking":
+            if field in _REASONING_FIELDS:
                 out.append(ReasoningText(text))
             elif field == "content":
                 out.append(text)
@@ -656,6 +675,10 @@ class InferenceThread:
                     loop.call_soon_threadsafe(future.set_exception, e)
                 else:
                     future.set_exception(e)
+            finally:
+                # Release closure references (e.g. model captured in generate fn)
+                # before blocking on the next queue.get(), so GPU memory can be freed.
+                fn = args = kwargs = None
 
     def submit(self, fn, *args, **kwargs) -> Future:
         """Submit a callable to the inference thread. Returns a blocking Future."""
@@ -1108,17 +1131,21 @@ class BaseHandler:
         """
         from fastapi import HTTPException
 
+        requested = body.get("model")
         if self.model_manager.force_model is not None:
-            requested = body.get("model")
             if requested is not None and requested != self.model_manager.force_model:
                 raise HTTPException(
                     status_code=400,
-                    detail=(f"Server is pinned to '{self.model_manager.force_model}'; requested '{requested}'."),
+                    detail=f"Server is pinned to '{self.model_manager.force_model}'; requested '{requested}'.",
                 )
-            body["model"] = self.model_manager.force_model
+            requested = self.model_manager.force_model
 
-        model_id = self.model_manager.process_model_name(body["model"])
-        model, processor = self.model_manager.load_model_and_processor(model_id)
+        # `<repo>:<file>.gguf` names both the repository and the weights to read out of it.
+        model, gguf_file = split_model_id(requested)
+        body["model"] = model
+
+        model_id = self.model_manager.process_model_name(model)
+        model, processor = self.model_manager.load_model_and_processor(model_id, gguf_file=gguf_file)
 
         return model_id, model, processor
 
@@ -1193,7 +1220,7 @@ class BaseHandler:
             parsed = {"role": message["role"], "content": []}
 
             # Parse function.arguments back to a dict — chat templates iterate it as a mapping.
-            if "tool_calls" in message:
+            if message.get("tool_calls"):
                 tool_calls = []
                 for tc in message["tool_calls"]:
                     tc = copy.deepcopy(tc)
@@ -1207,7 +1234,7 @@ class BaseHandler:
 
             # When tool_calls are present, ignore content — it's either empty or contains
             # raw tool call markup that would confuse the chat template if rendered.
-            raw_content = [] if "tool_calls" in message else (message.get("content") or [])
+            raw_content = [] if message.get("tool_calls") else (message.get("content") or [])
             if isinstance(raw_content, str):
                 raw_content = [{"type": "text", "text": raw_content}]
 
