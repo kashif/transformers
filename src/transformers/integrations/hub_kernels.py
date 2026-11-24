@@ -315,6 +315,13 @@ if is_kernels_available():
                         version=3,
                     ),
                 },
+                "rocm": {
+                    Mode.TRAINING | Mode.TORCH_COMPILE: LayerRepository(
+                        repo_id="kernels-community/liger-kernels",
+                        layer_name="LigerTiledSwiGLUMLP",
+                        version=4,
+                    ),
+                },
             },
             "GeGLUMLP": {
                 "cuda": {
@@ -327,6 +334,13 @@ if is_kernels_available():
                         repo_id="kernels-community/liger-kernels",
                         layer_name="LigerTiledGEGLUMLP",
                         version=3,
+                    ),
+                },
+                "rocm": {
+                    Mode.TRAINING | Mode.TORCH_COMPILE: LayerRepository(
+                        repo_id="kernels-community/liger-kernels",
+                        layer_name="LigerTiledGEGLUMLP",
+                        version=4,
                     ),
                 },
             },
