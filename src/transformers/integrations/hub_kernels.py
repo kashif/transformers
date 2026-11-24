@@ -312,7 +312,7 @@ if is_kernels_available():
                     Mode.TRAINING | Mode.TORCH_COMPILE: LayerRepository(
                         repo_id="kernels-community/liger-kernels",
                         layer_name="LigerTiledSwiGLUMLP",
-                        version=3,
+                        version=4,
                     ),
                 },
                 "rocm": {
@@ -333,7 +333,7 @@ if is_kernels_available():
                     Mode.TRAINING | Mode.TORCH_COMPILE: LayerRepository(
                         repo_id="kernels-community/liger-kernels",
                         layer_name="LigerTiledGEGLUMLP",
-                        version=3,
+                        version=4,
                     ),
                 },
                 "rocm": {
